@@ -866,6 +866,7 @@ async def upload_text_files_stream(
 
             embedding_requests: list[EmbeddingCreateRequest] = []
             file_summaries: list[dict[str, Any]] = []
+            embedding_batch_size = max(1, min(64, settings.embedding.concurrency * 8))
 
             processed_index = 0
             for upload in files:
@@ -921,7 +922,26 @@ async def upload_text_files_stream(
                     continue
 
                 try:
-                    embeddings = await embedding_service.generate_embeddings(chunks)
+                    embeddings: list[list[float]] = []
+                    completed_chunks = 0
+                    total_chunks = len(chunks)
+
+                    for start in range(0, total_chunks, embedding_batch_size):
+                        batch_chunks = chunks[start:start + embedding_batch_size]
+                        batch_embeddings = await embedding_service.generate_embeddings(batch_chunks)
+                        embeddings.extend(batch_embeddings)
+                        completed_chunks += len(batch_chunks)
+
+                        yield json.dumps(
+                            {
+                                "type": "file_progress",
+                                "index": processed_index,
+                                "total_files": total_files,
+                                "filename": upload.filename,
+                                "completed_chunks": completed_chunks,
+                                "total_chunks": total_chunks,
+                            }
+                        ) + "\n"
                 except Exception as exc:
                     raise HTTPException(
                         status_code=502,
@@ -929,6 +949,15 @@ async def upload_text_files_stream(
                             "Failed to generate embeddings via LiteLLM proxy. "
                             "Check EMBEDDING__BASE_URL and EMBEDDING__API_KEY settings. "
                             f"Details: {str(exc)}"
+                        ),
+                    )
+
+                if len(embeddings) != len(chunks):
+                    raise HTTPException(
+                        status_code=500,
+                        detail=(
+                            f"Embedding count mismatch for {upload.filename}: "
+                            f"expected {len(chunks)}, got {len(embeddings)}"
                         ),
                     )
 

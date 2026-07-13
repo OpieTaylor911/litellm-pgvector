@@ -528,7 +528,15 @@
       }, 1000);
 
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 10 * 60 * 1000);
+      const inactivityTimeoutMs = 10 * 60 * 1000;
+      let timeoutId = null;
+      const resetInactivityTimeout = () => {
+        if (timeoutId) {
+          clearTimeout(timeoutId);
+        }
+        timeoutId = setTimeout(() => controller.abort(), inactivityTimeoutMs);
+      };
+      resetInactivityTimeout();
 
       try {
         const response = await fetch('/v1/vector_stores/upload-text-files/stream', {
@@ -553,6 +561,7 @@
 
         while (true) {
           const { done, value } = await reader.read();
+          resetInactivityTimeout();
           if (done) {
             break;
           }
@@ -565,6 +574,7 @@
             if (!line.trim()) {
               continue;
             }
+            resetInactivityTimeout();
             const event = JSON.parse(line);
 
             if (event.type === 'started') {
@@ -579,6 +589,12 @@
             } else if (event.type === 'file_completed') {
               appendLog(
                 `Done ${event.index}/${event.total_files}: ${event.filename} (${event.chunk_count} chunk(s), ${event.character_count} chars)`
+              );
+            } else if (event.type === 'file_progress') {
+              const elapsed = Math.floor((Date.now() - startedAt) / 1000);
+              setUploadStatus(
+                `Uploading ${event.total_files} file(s)… ${event.index}/${event.total_files}: ${event.filename} (${event.completed_chunks}/${event.total_chunks} chunks, ${elapsed}s elapsed)`,
+                'busy'
               );
             } else if (event.type === 'file_skipped') {
               appendLog(`Skipped ${event.index}/${event.total_files}: ${event.filename} (${event.reason})`);
@@ -601,7 +617,7 @@
         await refreshStores();
       } catch (error) {
         if (error.name === 'AbortError') {
-          const message = 'Upload timed out after 10 minutes. The server may still be processing.';
+          const message = 'Upload timed out after 10 minutes of inactivity. The server may still be processing.';
           setLog({ error: message });
           setUploadStatus(message, 'error');
         } else {
