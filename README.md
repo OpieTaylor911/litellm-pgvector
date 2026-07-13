@@ -180,6 +180,39 @@ Or using uvicorn directly:
 uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
+## Run As A System Service (Auto-Start On Boot)
+
+On Linux systems with systemd, install this API as a boot-time service:
+
+```bash
+cd /opt/pgvector/litellm-pgvector
+sudo ./scripts/install_systemd_service.sh
+```
+
+The installer will:
+
+- Create/update `.venv` and install `requirements.txt`
+- Generate Prisma client (if `prisma/schema.prisma` exists)
+- Create `/etc/default/litellm-pgvector` if missing
+- Install and enable `litellm-pgvector.service`
+
+After installation, manage the service with:
+
+```bash
+sudo systemctl status litellm-pgvector
+sudo systemctl restart litellm-pgvector
+sudo journalctl -u litellm-pgvector -f
+```
+
+Service runtime config is read from:
+
+```text
+/etc/default/litellm-pgvector
+```
+
+Update `SERVER_API_KEY`, database connection, and embedding settings there, then restart the service.
+The installer defaults the systemd service to port `18001` (change `PORT` in that file if needed).
+
 ## Docker Deployment
 
 ### Build and run with Docker:
