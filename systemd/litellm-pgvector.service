@@ -9,6 +9,7 @@ User={{RUN_USER}}
 Group={{RUN_GROUP}}
 WorkingDirectory={{APP_DIR}}
 EnvironmentFile=-/etc/default/litellm-pgvector
+EnvironmentFile=-{{APP_DIR}}/.env
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONPATH={{APP_DIR}}
 Environment=HOST=0.0.0.0

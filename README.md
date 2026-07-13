@@ -212,6 +212,7 @@ Service runtime config is read from:
 
 Update `SERVER_API_KEY`, database connection, and embedding settings there, then restart the service.
 The installer defaults the systemd service to port `18001` (change `PORT` in that file if needed).
+The service also loads `litellm-pgvector/.env` and uses those values as overrides, so UI/API credentials in `.env` will take effect after restart.
 
 ## Docker Deployment
 
