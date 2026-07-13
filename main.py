@@ -1,10 +1,17 @@
 import os
 import asyncio
 import time
-from typing import List, Optional
-from fastapi import FastAPI, HTTPException, Depends, Header
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+import json
+import secrets
+import re
+from collections import deque
+from datetime import datetime
+from pathlib import Path
+from typing import Any, List, Optional
+from fastapi import FastAPI, HTTPException, Depends, File, Form, UploadFile
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials, HTTPBasic, HTTPBasicCredentials
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, StreamingResponse
 from prisma import Prisma
 from dotenv import load_dotenv
 
@@ -26,6 +33,8 @@ from embedding_service import embedding_service
 
 load_dotenv()
 
+UPLOAD_PAGE_PATH = Path(__file__).parent / "ui" / "index.html"
+
 app = FastAPI(
     title="OpenAI Vector Stores API",
     description="OpenAI-compatible Vector Stores API using PGVector",
@@ -43,8 +52,11 @@ app.add_middleware(
 
 # Global Prisma client
 db = Prisma()
+activity_events: deque[dict[str, Any]] = deque(maxlen=2000)
+activity_event_id = 0
 
 security = HTTPBearer()
+ui_security = HTTPBasic()
 
 
 async def get_api_key(credentials: HTTPAuthorizationCredentials = Depends(security)):
@@ -55,16 +67,60 @@ async def get_api_key(credentials: HTTPAuthorizationCredentials = Depends(securi
     return credentials.credentials
 
 
+def record_activity(event_type: str, message: str, **data: Any) -> dict[str, Any]:
+    """Record in-memory activity events for UI live-tail polling."""
+    global activity_event_id
+    activity_event_id += 1
+    event = {
+        "id": activity_event_id,
+        "timestamp": int(time.time()),
+        "type": event_type,
+        "message": message,
+    }
+    if data:
+        event["data"] = data
+    activity_events.append(event)
+    return event
+
+
+async def require_ui_login(credentials: HTTPBasicCredentials = Depends(ui_security)):
+    """Protect UI page with Basic auth credentials from settings."""
+    username_ok = secrets.compare_digest(credentials.username, settings.ui_username)
+    password_ok = secrets.compare_digest(credentials.password, settings.ui_password)
+    if not (username_ok and password_ok):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid UI username or password",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+    return credentials.username
+
+
 @app.on_event("startup")
 async def startup():
     """Connect to database on startup"""
     await db.connect()
+    record_activity("system", "Server started")
 
 
 @app.on_event("shutdown")
 async def shutdown():
     """Disconnect from database on shutdown"""
+    record_activity("system", "Server shutting down")
     await db.disconnect()
+
+
+@app.get("/v1/activity")
+async def list_activity(
+    after_id: int = 0,
+    limit: int = 100,
+    api_key: str = Depends(get_api_key),
+):
+    safe_limit = min(max(limit, 1), 500)
+    items = [item for item in activity_events if item["id"] > after_id]
+    data = items[:safe_limit]
+    last_id = data[-1]["id"] if data else after_id
+    return {"object": "list", "data": data, "last_id": last_id}
 
 
 async def generate_query_embedding(query: str) -> List[float]:
@@ -72,6 +128,229 @@ async def generate_query_embedding(query: str) -> List[float]:
     Generate an embedding for the query using LiteLLM
     """
     return await embedding_service.generate_embedding(query)
+
+
+def to_unix_timestamp(value):
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return int(value.timestamp())
+    if isinstance(value, str):
+        return int(datetime.fromisoformat(value).timestamp())
+    return int(value)
+
+
+def chunk_text(text: str, max_chars: int = 1600, overlap: int = 200) -> list[str]:
+    normalized_text = text.replace("\r\n", "\n").strip()
+    if not normalized_text:
+        return []
+
+    cleaned_overlap = max(0, min(overlap, max_chars // 2))
+    paragraphs = [part.strip() for part in normalized_text.split("\n\n") if part.strip()]
+    chunks: list[str] = []
+    current = ""
+
+    for paragraph in paragraphs or [normalized_text]:
+        if len(paragraph) > max_chars:
+            if current:
+                chunks.append(current)
+                current = ""
+
+            start = 0
+            step = max_chars - cleaned_overlap or max_chars
+            while start < len(paragraph):
+                piece = paragraph[start:start + max_chars].strip()
+                if piece:
+                    chunks.append(piece)
+                start += step
+            continue
+
+        candidate = paragraph if not current else f"{current}\n\n{paragraph}"
+        if len(candidate) <= max_chars:
+            current = candidate
+        else:
+            chunks.append(current)
+            current = paragraph
+
+    if current:
+        chunks.append(current)
+
+    return chunks
+
+
+async def create_vector_store_record(
+    name: str,
+    expires_after: Optional[dict[str, Any]] = None,
+    metadata: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    vector_store_table = settings.table_names["vector_stores"]
+    result = await db.query_raw(
+        f"""
+        INSERT INTO {vector_store_table} (id, name, file_counts, status, usage_bytes, expires_after, metadata, created_at)
+        VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, NOW())
+        RETURNING id, name, file_counts, status, usage_bytes, expires_after, expires_at, last_active_at, metadata,
+                 EXTRACT(EPOCH FROM created_at)::bigint as created_at_timestamp
+        """,
+        name,
+        {"in_progress": 0, "completed": 0, "failed": 0, "cancelled": 0, "total": 0},
+        "completed",
+        0,
+        expires_after,
+        metadata or {},
+    )
+    if not result:
+        raise HTTPException(status_code=500, detail="Failed to create vector store")
+    return result[0]
+
+
+async def get_vector_store_id_or_create(
+    vector_store_id: Optional[str],
+    vector_store_name: Optional[str],
+) -> tuple[str, str, bool]:
+    vector_store_table = settings.table_names["vector_stores"]
+    if vector_store_id:
+        result = await db.query_raw(
+            f"SELECT id, name FROM {vector_store_table} WHERE id = $1",
+            vector_store_id,
+        )
+        if not result:
+            raise HTTPException(status_code=404, detail="Vector store not found")
+        return vector_store_id, result[0]["name"], False
+
+    cleaned_name = (vector_store_name or "").strip()
+    if not cleaned_name:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide either vector_store_id or vector_store_name",
+        )
+
+    vector_store = await create_vector_store_record(
+        cleaned_name,
+        metadata={"created_via": "upload_ui"},
+    )
+    return vector_store["id"], vector_store["name"], True
+
+
+def _sanitize_path_segment(value: str) -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9._-]+", "_", value.strip())
+    return cleaned or "untitled"
+
+
+def backup_uploaded_text_file(store_name: str, filename: str, raw_bytes: bytes) -> Path:
+    backup_root = Path(settings.backup_root_dir)
+    store_dir = backup_root / _sanitize_path_segment(store_name)
+    store_dir.mkdir(parents=True, exist_ok=True)
+
+    source_name = Path(filename).name
+    stem = _sanitize_path_segment(Path(source_name).stem)
+    suffix = Path(source_name).suffix or ".txt"
+
+    timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
+    backup_path = store_dir / f"{timestamp}_{stem}{suffix}"
+    counter = 1
+    while backup_path.exists():
+        backup_path = store_dir / f"{timestamp}_{stem}_{counter}{suffix}"
+        counter += 1
+
+    backup_path.write_bytes(raw_bytes)
+    return backup_path
+
+
+async def insert_embeddings_records(
+    vector_store_id: str,
+    embeddings: list[EmbeddingCreateRequest],
+) -> list[EmbeddingResponse]:
+    if not embeddings:
+        raise HTTPException(status_code=400, detail="No embeddings provided")
+
+    vector_store_table = settings.table_names["vector_stores"]
+    fields = settings.db_fields
+    table_name = settings.table_names["embeddings"]
+
+    # PostgreSQL prepared statements cap bind params at 32767.
+    # Each row consumes 4 params in this INSERT, so we batch safely below the limit.
+    max_bind_params = 30000
+    params_per_row = 4
+    rows_per_batch = max(1, max_bind_params // params_per_row)
+
+    all_rows: list[dict[str, Any]] = []
+
+    for batch_start in range(0, len(embeddings), rows_per_batch):
+        batch_embeddings = embeddings[batch_start:batch_start + rows_per_batch]
+
+        values_clauses = []
+        params: list[Any] = []
+        param_count = 1
+
+        for embedding_req in batch_embeddings:
+            embedding_vector_str = "[" + ",".join(map(str, embedding_req.embedding)) + "]"
+            values_clauses.append(
+                f"(gen_random_uuid(), ${param_count}, ${param_count + 1}, ${param_count + 2}::vector, ${param_count + 3}, NOW())"
+            )
+            params.extend([
+                vector_store_id,
+                embedding_req.content,
+                embedding_vector_str,
+                embedding_req.metadata or {},
+            ])
+            param_count += 4
+
+        values_clause = ", ".join(values_clauses)
+        batch_result = await db.query_raw(
+            f"""
+            INSERT INTO {table_name} ({fields.id_field}, {fields.vector_store_id_field}, {fields.content_field},
+                                     {fields.embedding_field}, {fields.metadata_field}, {fields.created_at_field})
+            VALUES {values_clause}
+            RETURNING {fields.id_field}, {fields.vector_store_id_field}, {fields.content_field},
+                     {fields.metadata_field}, EXTRACT(EPOCH FROM {fields.created_at_field})::bigint as created_at_timestamp
+            """,
+            *params,
+        )
+
+        if not batch_result:
+            raise HTTPException(status_code=500, detail="Failed to create embeddings")
+
+        all_rows.extend(batch_result)
+
+    total_content_length = sum(len(embedding.content) for embedding in embeddings)
+    await db.query_raw(
+        f"""
+        UPDATE {vector_store_table}
+        SET
+            file_counts = jsonb_set(
+                jsonb_set(
+                    COALESCE(file_counts, '{{"in_progress": 0, "completed": 0, "failed": 0, "cancelled": 0, "total": 0}}'::jsonb),
+                    '{{completed}}',
+                    (COALESCE(file_counts->>'completed', '0')::int + $2)::text::jsonb
+                ),
+                '{{total}}',
+                (COALESCE(file_counts->>'total', '0')::int + $2)::text::jsonb
+            ),
+            usage_bytes = COALESCE(usage_bytes, 0) + $3,
+            last_active_at = NOW()
+        WHERE id = $1
+        """,
+        vector_store_id,
+        len(embeddings),
+        total_content_length,
+    )
+
+    return [
+        EmbeddingResponse(
+            id=row[fields.id_field],
+            vector_store_id=row[fields.vector_store_id_field],
+            content=row[fields.content_field],
+            metadata=row[fields.metadata_field],
+            created_at=int(row["created_at_timestamp"]),
+        )
+        for row in all_rows
+    ]
+
+
+@app.get("/", response_class=FileResponse, dependencies=[Depends(require_ui_login)])
+@app.get("/ui", response_class=FileResponse, dependencies=[Depends(require_ui_login)])
+async def upload_ui():
+    return FileResponse(UPLOAD_PAGE_PATH)
 
 
 @app.post("/v1/vector_stores", response_model=VectorStoreResponse)
@@ -84,32 +363,16 @@ async def create_vector_store(
     """
     try:
         # Use raw SQL to insert the vector store with configurable table/field names
-        vector_store_table = settings.table_names["vector_stores"]
-        
-        result = await db.query_raw(
-            f"""
-            INSERT INTO {vector_store_table} (id, name, file_counts, status, usage_bytes, expires_after, metadata, created_at)
-            VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, NOW())
-            RETURNING id, name, file_counts, status, usage_bytes, expires_after, expires_at, last_active_at, metadata, 
-                     EXTRACT(EPOCH FROM created_at)::bigint as created_at_timestamp
-            """,
+        vector_store = await create_vector_store_record(
             request.name,
-            {"in_progress": 0, "completed": 0, "failed": 0, "cancelled": 0, "total": 0},
-            "completed",
-            0,
-            request.expires_after,
-            request.metadata or {}
+            expires_after=request.expires_after,
+            metadata=request.metadata,
         )
-        
-        if not result:
-            raise HTTPException(status_code=500, detail="Failed to create vector store")
-            
-        vector_store = result[0]
         
         # Convert to response format
         created_at = int(vector_store["created_at_timestamp"])
-        expires_at = int(vector_store["expires_at"].timestamp()) if vector_store.get("expires_at") else None
-        last_active_at = int(vector_store["last_active_at"].timestamp()) if vector_store.get("last_active_at") else None
+        expires_at = to_unix_timestamp(vector_store.get("expires_at"))
+        last_active_at = to_unix_timestamp(vector_store.get("last_active_at"))
         
         return VectorStoreResponse(
             id=vector_store["id"],
@@ -183,8 +446,8 @@ async def list_vector_stores(
         vector_stores = []
         for row in results:
             created_at = int(row["created_at_timestamp"])
-            expires_at = int(row["expires_at"].timestamp()) if row.get("expires_at") else None
-            last_active_at = int(row["last_active_at"].timestamp()) if row.get("last_active_at") else None
+            expires_at = to_unix_timestamp(row.get("expires_at"))
+            last_active_at = to_unix_timestamp(row.get("last_active_at"))
             
             vector_store = VectorStoreResponse(
                 id=row["id"],
@@ -421,82 +684,7 @@ async def create_embeddings_batch(
         if not vector_store_result:
             raise HTTPException(status_code=404, detail="Vector store not found")
         
-        if not request.embeddings:
-            raise HTTPException(status_code=400, detail="No embeddings provided")
-        
-        # Prepare batch insert
-        fields = settings.db_fields
-        table_name = settings.table_names["embeddings"]
-        
-        # Build VALUES clause for batch insert
-        values_clauses = []
-        params = []
-        param_count = 1
-        
-        for embedding_req in request.embeddings:
-            embedding_vector_str = "[" + ",".join(map(str, embedding_req.embedding)) + "]"
-            values_clauses.append(f"(gen_random_uuid(), ${param_count}, ${param_count + 1}, ${param_count + 2}::vector, ${param_count + 3}, NOW())")
-            params.extend([
-                vector_store_id,
-                embedding_req.content,
-                embedding_vector_str,
-                embedding_req.metadata or {}
-            ])
-            param_count += 4
-        
-        values_clause = ", ".join(values_clauses)
-        
-        # Execute batch insert
-        result = await db.query_raw(
-            f"""
-            INSERT INTO {table_name} ({fields.id_field}, {fields.vector_store_id_field}, {fields.content_field}, 
-                                     {fields.embedding_field}, {fields.metadata_field}, {fields.created_at_field})
-            VALUES {values_clause}
-            RETURNING {fields.id_field}, {fields.vector_store_id_field}, {fields.content_field}, 
-                     {fields.metadata_field}, EXTRACT(EPOCH FROM {fields.created_at_field})::bigint as created_at_timestamp
-            """,
-            *params
-        )
-        
-        if not result:
-            raise HTTPException(status_code=500, detail="Failed to create embeddings")
-        
-        # Calculate total content length for usage bytes update
-        total_content_length = sum(len(emb.content) for emb in request.embeddings)
-        
-        # Update vector store statistics
-        await db.query_raw(
-            f"""
-            UPDATE {vector_store_table} 
-            SET 
-                file_counts = jsonb_set(
-                    jsonb_set(
-                        COALESCE(file_counts, '{{"in_progress": 0, "completed": 0, "failed": 0, "cancelled": 0, "total": 0}}'::jsonb),
-                        '{{completed}}',
-                        (COALESCE(file_counts->>'completed', '0')::int + $2)::text::jsonb
-                    ),
-                    '{{total}}',
-                    (COALESCE(file_counts->>'total', '0')::int + $2)::text::jsonb
-                ),
-                usage_bytes = COALESCE(usage_bytes, 0) + $3,
-                last_active_at = NOW()
-            WHERE id = $1
-            """,
-            vector_store_id,
-            len(request.embeddings),
-            total_content_length
-        )
-        
-        # Convert results to response format
-        embeddings = []
-        for row in result:
-            embeddings.append(EmbeddingResponse(
-                id=row[fields.id_field],
-                vector_store_id=row[fields.vector_store_id_field],
-                content=row[fields.content_field],
-                metadata=row[fields.metadata_field],
-                created_at=int(row["created_at_timestamp"])
-            ))
+        embeddings = await insert_embeddings_records(vector_store_id, request.embeddings)
         
         return EmbeddingBatchCreateResponse(
             data=embeddings,
@@ -509,6 +697,331 @@ async def create_embeddings_batch(
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Failed to create embeddings batch: {str(e)}")
+
+
+@app.post("/v1/vector_stores/upload-text-files")
+async def upload_text_files(
+    files: list[UploadFile] = File(...),
+    vector_store_id: Optional[str] = Form(None),
+    vector_store_name: Optional[str] = Form(None),
+    chunk_size: int = Form(1600),
+    chunk_overlap: int = Form(200),
+    api_key: str = Depends(get_api_key),
+):
+    if chunk_size < 200:
+        raise HTTPException(status_code=400, detail="chunk_size must be at least 200")
+    if chunk_overlap < 0 or chunk_overlap >= chunk_size:
+        raise HTTPException(
+            status_code=400,
+            detail="chunk_overlap must be non-negative and smaller than chunk_size",
+        )
+
+    resolved_vector_store_id, resolved_vector_store_name, created_new_store = await get_vector_store_id_or_create(
+        vector_store_id,
+        vector_store_name,
+    )
+    record_activity(
+        "upload_started",
+        f"Upload started for store '{resolved_vector_store_name}'",
+        vector_store_id=resolved_vector_store_id,
+        store_name=resolved_vector_store_name,
+        total_files=len(files),
+    )
+
+    embedding_requests: list[EmbeddingCreateRequest] = []
+    file_summaries: list[dict[str, Any]] = []
+
+    for upload in files:
+        if not upload.filename:
+            continue
+        if not upload.filename.lower().endswith(".txt"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Only .txt files are supported: {upload.filename}",
+            )
+
+        raw_bytes = await upload.read()
+        try:
+            backup_uploaded_text_file(resolved_vector_store_name, upload.filename, raw_bytes)
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Failed to back up file {upload.filename}: {str(exc)}")
+        try:
+            text = raw_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            text = raw_bytes.decode("utf-8-sig", errors="replace")
+
+        chunks = chunk_text(text, max_chars=chunk_size, overlap=chunk_overlap)
+        if not chunks:
+            continue
+
+        try:
+            embeddings = await embedding_service.generate_embeddings(chunks)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    "Failed to generate embeddings via LiteLLM proxy. "
+                    "Check EMBEDDING__BASE_URL and EMBEDDING__API_KEY settings. "
+                    f"Details: {str(exc)}"
+                ),
+            )
+        for index, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
+            embedding_requests.append(
+                EmbeddingCreateRequest(
+                    content=chunk,
+                    embedding=embedding,
+                    metadata={
+                        "filename": upload.filename,
+                        "chunk_index": index,
+                        "chunk_count": len(chunks),
+                        "source": "upload_ui",
+                    },
+                )
+            )
+
+        file_summaries.append(
+            {
+                "filename": upload.filename,
+                "chunk_count": len(chunks),
+                "character_count": len(text),
+            }
+        )
+        record_activity(
+            "file_completed",
+            f"Processed {upload.filename}",
+            vector_store_id=resolved_vector_store_id,
+            store_name=resolved_vector_store_name,
+            filename=upload.filename,
+            chunk_count=len(chunks),
+            character_count=len(text),
+        )
+
+    if not embedding_requests:
+        raise HTTPException(status_code=400, detail="No usable text content found in uploaded files")
+
+    created_embeddings = await insert_embeddings_records(
+        resolved_vector_store_id,
+        embedding_requests,
+    )
+    record_activity(
+        "upload_completed",
+        f"Upload completed for store '{resolved_vector_store_name}'",
+        vector_store_id=resolved_vector_store_id,
+        store_name=resolved_vector_store_name,
+        files_processed=len(file_summaries),
+        embeddings_created=len(created_embeddings),
+    )
+
+    return {
+        "vector_store_id": resolved_vector_store_id,
+        "created_new_store": created_new_store,
+        "files": file_summaries,
+        "embeddings_created": len(created_embeddings),
+        "created": int(time.time()),
+    }
+
+
+@app.post("/v1/vector_stores/upload-text-files/stream")
+async def upload_text_files_stream(
+    files: list[UploadFile] = File(...),
+    vector_store_id: Optional[str] = Form(None),
+    vector_store_name: Optional[str] = Form(None),
+    chunk_size: int = Form(1600),
+    chunk_overlap: int = Form(200),
+    api_key: str = Depends(get_api_key),
+):
+    async def event_stream():
+        try:
+            if chunk_size < 200:
+                raise HTTPException(status_code=400, detail="chunk_size must be at least 200")
+            if chunk_overlap < 0 or chunk_overlap >= chunk_size:
+                raise HTTPException(
+                    status_code=400,
+                    detail="chunk_overlap must be non-negative and smaller than chunk_size",
+                )
+
+            resolved_vector_store_id, resolved_vector_store_name, created_new_store = await get_vector_store_id_or_create(
+                vector_store_id,
+                vector_store_name,
+            )
+            record_activity(
+                "upload_started",
+                f"Stream upload started for store '{resolved_vector_store_name}'",
+                vector_store_id=resolved_vector_store_id,
+                store_name=resolved_vector_store_name,
+                total_files=len(files),
+            )
+
+            valid_filenames = [upload.filename for upload in files if upload.filename]
+            total_files = len(valid_filenames)
+
+            yield json.dumps(
+                {
+                    "type": "started",
+                    "vector_store_id": resolved_vector_store_id,
+                    "created_new_store": created_new_store,
+                    "total_files": total_files,
+                }
+            ) + "\n"
+
+            embedding_requests: list[EmbeddingCreateRequest] = []
+            file_summaries: list[dict[str, Any]] = []
+
+            processed_index = 0
+            for upload in files:
+                if not upload.filename:
+                    continue
+
+                processed_index += 1
+                record_activity(
+                    "file_started",
+                    f"Starting {upload.filename}",
+                    vector_store_id=resolved_vector_store_id,
+                    store_name=resolved_vector_store_name,
+                    filename=upload.filename,
+                    index=processed_index,
+                    total_files=total_files,
+                )
+                yield json.dumps(
+                    {
+                        "type": "file_started",
+                        "index": processed_index,
+                        "total_files": total_files,
+                        "filename": upload.filename,
+                    }
+                ) + "\n"
+
+                if not upload.filename.lower().endswith(".txt"):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Only .txt files are supported: {upload.filename}",
+                    )
+
+                raw_bytes = await upload.read()
+                try:
+                    backup_uploaded_text_file(resolved_vector_store_name, upload.filename, raw_bytes)
+                except Exception as exc:
+                    raise HTTPException(status_code=500, detail=f"Failed to back up file {upload.filename}: {str(exc)}")
+                try:
+                    text = raw_bytes.decode("utf-8")
+                except UnicodeDecodeError:
+                    text = raw_bytes.decode("utf-8-sig", errors="replace")
+
+                chunks = chunk_text(text, max_chars=chunk_size, overlap=chunk_overlap)
+                if not chunks:
+                    yield json.dumps(
+                        {
+                            "type": "file_skipped",
+                            "index": processed_index,
+                            "total_files": total_files,
+                            "filename": upload.filename,
+                            "reason": "No usable text content found",
+                        }
+                    ) + "\n"
+                    continue
+
+                try:
+                    embeddings = await embedding_service.generate_embeddings(chunks)
+                except Exception as exc:
+                    raise HTTPException(
+                        status_code=502,
+                        detail=(
+                            "Failed to generate embeddings via LiteLLM proxy. "
+                            "Check EMBEDDING__BASE_URL and EMBEDDING__API_KEY settings. "
+                            f"Details: {str(exc)}"
+                        ),
+                    )
+
+                for index, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
+                    embedding_requests.append(
+                        EmbeddingCreateRequest(
+                            content=chunk,
+                            embedding=embedding,
+                            metadata={
+                                "filename": upload.filename,
+                                "chunk_index": index,
+                                "chunk_count": len(chunks),
+                                "source": "upload_ui",
+                            },
+                        )
+                    )
+
+                file_summary = {
+                    "filename": upload.filename,
+                    "chunk_count": len(chunks),
+                    "character_count": len(text),
+                }
+                file_summaries.append(file_summary)
+                record_activity(
+                    "file_completed",
+                    f"Processed {upload.filename}",
+                    vector_store_id=resolved_vector_store_id,
+                    store_name=resolved_vector_store_name,
+                    filename=upload.filename,
+                    chunk_count=len(chunks),
+                    character_count=len(text),
+                    index=processed_index,
+                    total_files=total_files,
+                )
+
+                yield json.dumps(
+                    {
+                        "type": "file_completed",
+                        "index": processed_index,
+                        "total_files": total_files,
+                        **file_summary,
+                    }
+                ) + "\n"
+
+            if not embedding_requests:
+                raise HTTPException(status_code=400, detail="No usable text content found in uploaded files")
+
+            created_embeddings = await insert_embeddings_records(
+                resolved_vector_store_id,
+                embedding_requests,
+            )
+
+            result_payload = {
+                "vector_store_id": resolved_vector_store_id,
+                "created_new_store": created_new_store,
+                "files": file_summaries,
+                "embeddings_created": len(created_embeddings),
+                "created": int(time.time()),
+            }
+            record_activity(
+                "upload_completed",
+                f"Stream upload completed for store '{resolved_vector_store_name}'",
+                vector_store_id=resolved_vector_store_id,
+                store_name=resolved_vector_store_name,
+                files_processed=len(file_summaries),
+                embeddings_created=len(created_embeddings),
+            )
+            yield json.dumps({"type": "complete", "result": result_payload}) + "\n"
+
+        except HTTPException as exc:
+            record_activity("upload_error", "Upload failed", status_code=exc.status_code, detail=str(exc.detail))
+            yield json.dumps(
+                {
+                    "type": "error",
+                    "status_code": exc.status_code,
+                    "detail": exc.detail,
+                }
+            ) + "\n"
+        except Exception as exc:
+            record_activity("upload_error", "Upload failed", status_code=500, detail=str(exc))
+            yield json.dumps(
+                {
+                    "type": "error",
+                    "status_code": 500,
+                    "detail": f"Unexpected upload failure: {str(exc)}",
+                }
+            ) + "\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="application/x-ndjson",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.get("/health")

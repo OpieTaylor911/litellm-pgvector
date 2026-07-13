@@ -3,7 +3,7 @@ uvicorn[standard]==0.24.0
 prisma==0.11.0
 python-dotenv==1.0.0
 pydantic>=2.5.0
-psycopg2-binary==2.9.7
+psycopg2-binary==2.9.12
 pgvector==0.2.4
 python-multipart==0.0.6
 litellm==1.74.3

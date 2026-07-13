@@ -1,3 +1,4 @@
+import asyncio
 from typing import List, Optional
 from config import settings, EmbeddingConfig
 from litellm.types.utils import EmbeddingResponse
@@ -57,27 +58,21 @@ class EmbeddingService:
             List of embedding vectors
         """
         try:
-            # Generate embeddings using LiteLLM
-            response = await litellm.aembedding(
-                model=self.config.model,
-                input=texts,
-                api_base=self.config.base_url,
-                api_key=self.config.api_key
-            )
-            
-            # Extract embeddings from response
-            embeddings = [item.embedding for item in response.data]
-            
-            # Validate embedding dimensions
-            for i, embedding in enumerate(embeddings):
-                if len(embedding) != self.config.dimensions:
-                    raise ValueError(
-                        f"Expected embedding dimension {self.config.dimensions} for text {i}, "
-                        f"got {len(embedding)}"
-                    )
-            
-            return embeddings
-            
+            if not texts:
+                return []
+
+            concurrency = max(1, int(self.config.concurrency))
+            semaphore = asyncio.Semaphore(concurrency)
+
+            async def embed_with_limit(index: int, text: str) -> tuple[int, List[float]]:
+                async with semaphore:
+                    embedding = await self.generate_embedding(text)
+                    return index, embedding
+
+            tasks = [embed_with_limit(i, text) for i, text in enumerate(texts)]
+            results = await asyncio.gather(*tasks)
+            results.sort(key=lambda item: item[0])
+            return [embedding for _, embedding in results]
         except Exception as e:
             raise RuntimeError(f"Failed to generate embeddings: {str(e)}")
     

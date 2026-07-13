@@ -19,6 +19,7 @@ class EmbeddingConfig(BaseModel):
     base_url: str = "http://localhost:4000"  # LiteLLM proxy URL
     api_key: str = "sk-1234"  # LiteLLM proxy API key
     dimensions: int = 1536
+    concurrency: int = 8
 
 
 class Settings(BaseSettings):
@@ -28,6 +29,9 @@ class Settings(BaseSettings):
     
     # API configuration
     server_api_key: str = "your-api-key-here"
+    ui_username: str = "admin"
+    ui_password: str = "change-me-now"
+    backup_root_dir: str = "backup"
     port: int = 8000
     host: str = "0.0.0.0"
     
