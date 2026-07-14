@@ -247,6 +247,40 @@
       transform: none;
     }
 
+    .query-result {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 14px 16px;
+      margin-top: 10px;
+      background: rgba(255,255,255,0.03);
+    }
+
+    .query-result-meta {
+      font-size: 0.78rem;
+      color: var(--muted);
+      margin-bottom: 6px;
+      display: flex;
+      gap: 16px;
+    }
+
+    .query-result-score {
+      color: var(--accent-2);
+      font-weight: 600;
+    }
+
+    .query-result-text {
+      font-size: 0.92rem;
+      line-height: 1.6;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    #query-results:empty::after {
+      content: 'No results yet.';
+      color: var(--muted);
+      font-style: italic;
+    }
+
     @media (max-width: 820px) {
       .layout, .row { grid-template-columns: 1fr; }
       main { margin: 16px auto; padding: 18px; }
@@ -318,6 +352,33 @@
         <pre id="result">Waiting for input…</pre>
       </section>
     </div>
+
+    <section class="card grid" style="margin-top:24px;">
+      <h2>Query Vector Store</h2>
+      <div class="row">
+        <label>
+          Store to search
+          <select id="query-store-select">
+            <option value="">— select a store —</option>
+          </select>
+        </label>
+        <label>
+          Max results
+          <input id="query-limit" type="number" value="5" min="1" max="50" step="1">
+        </label>
+      </div>
+      <div class="row">
+        <label style="flex:1;">
+          Query
+          <input id="query-text" placeholder="Enter your search query…" autocomplete="off">
+        </label>
+        <div style="align-self:end;">
+          <button type="button" id="query-button">Search</button>
+        </div>
+      </div>
+      <div class="upload-status" id="query-status" aria-live="polite">Ready</div>
+      <div id="query-results"></div>
+    </section>
   </main>
 
   <script>
@@ -662,6 +723,87 @@
     checkHealth();
     refreshStores();
     startActivityTail();
+
+    // ── Query section ──────────────────────────────────────────────────────────
+    const queryStoreSelect = document.getElementById('query-store-select');
+    const queryText = document.getElementById('query-text');
+    const queryLimit = document.getElementById('query-limit');
+    const queryButton = document.getElementById('query-button');
+    const queryStatus = document.getElementById('query-status');
+    const queryResults = document.getElementById('query-results');
+
+    function setQueryStatus(message, kind = 'idle') {
+      queryStatus.textContent = message;
+      queryStatus.classList.remove('busy', 'error', 'success');
+      if (kind !== 'idle') queryStatus.classList.add(kind);
+    }
+
+    function syncQueryStores() {
+      const current = queryStoreSelect.value;
+      queryStoreSelect.innerHTML = '<option value="">— select a store —</option>';
+      for (const opt of vectorStoreSelect.options) {
+        if (!opt.value) continue;
+        const o = document.createElement('option');
+        o.value = opt.value;
+        o.textContent = opt.textContent;
+        if (opt.value === current) o.selected = true;
+        queryStoreSelect.appendChild(o);
+      }
+    }
+
+    // Keep query store list in sync whenever the main list changes.
+    new MutationObserver(syncQueryStores).observe(vectorStoreSelect, { childList: true });
+
+    async function runQuery() {
+      const storeId = queryStoreSelect.value.trim();
+      const q = queryText.value.trim();
+      if (!storeId) { setQueryStatus('Select a store to search.', 'error'); return; }
+      if (!q)       { setQueryStatus('Enter a query first.', 'error'); return; }
+
+      queryButton.disabled = true;
+      setQueryStatus('Searching…', 'busy');
+      queryResults.innerHTML = '';
+
+      try {
+        const response = await fetch(`/v1/vector_stores/${encodeURIComponent(storeId)}/search`, {
+          method: 'POST',
+          headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+          body: JSON.stringify({ query: q, max_num_results: parseInt(queryLimit.value, 10) || 5 }),
+        });
+        const payload = await readResponsePayload(response);
+        if (!response.ok) throw new Error(payload?.detail || `Search failed (${response.status})`);
+
+        const results = payload.data || [];
+        if (!results.length) {
+          setQueryStatus('No results found.', 'idle');
+          return;
+        }
+
+        setQueryStatus(`${results.length} result(s) returned.`, 'success');
+        for (const item of results) {
+          const content = (item.content || []).map(c => c.text?.value ?? c.text ?? '').join('\n');
+          const score = typeof item.score === 'number' ? item.score.toFixed(4) : '—';
+          const filename = item.attributes?.filename ?? item.file_id ?? '';
+          const div = document.createElement('div');
+          div.className = 'query-result';
+          div.innerHTML = `
+            <div class="query-result-meta">
+              <span class="query-result-score">score ${score}</span>
+              ${filename ? `<span>${filename}</span>` : ''}
+            </div>
+            <div class="query-result-text"></div>`;
+          div.querySelector('.query-result-text').textContent = content;
+          queryResults.appendChild(div);
+        }
+      } catch (error) {
+        setQueryStatus(`Error: ${error.message}`, 'error');
+      } finally {
+        queryButton.disabled = false;
+      }
+    }
+
+    queryButton.addEventListener('click', runQuery);
+    queryText.addEventListener('keydown', (e) => { if (e.key === 'Enter') runQuery(); });
   </script>
 </body>
 </html>
