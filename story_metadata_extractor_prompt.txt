@@ -1,0 +1,41 @@
+Single-pass ingest design
+=========================
+
+Goal
+----
+Replace the 8-stage ingest chain with one whole-story structured extraction pass
+that fills the `StoryMetadata` schema directly.
+
+Recommended workflow
+--------------------
+1. Read full story text.
+2. Run one LLM extraction call against the full story.
+3. Validate against Pydantic `StoryMetadata`.
+4. Retry once or twice on malformed JSON / schema mismatch.
+5. Upload into `/v1/vector_stores/{id}/stories/{filename}/metadata`.
+6. Human-QA a sample before trusting tags at scale.
+
+Why this is better
+------------------
+- Much fewer calls than scene-by-scene multi-stage analysis.
+- Better consistency for tone, tropes, relationship arc, ending, and heat.
+- Better match to the existing database schema.
+- Easier to debug and cheaper to run.
+
+What should stay separate
+-------------------------
+If needed later, keep these as distinct passes:
+- scene splitting / scene summaries (for retrieval UX)
+- character graph extraction
+- timeline extraction
+
+What should NOT stay separate
+-----------------------------
+Do not keep separate LLM stages for:
+- trope detector
+- relationship analyzer
+- kink analyzer
+- theme analyzer
+- metadata merger
+
+Those belong in one whole-story extraction pass.

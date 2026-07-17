@@ -22,6 +22,7 @@ model VectorStore {
   last_active_at DateTime?
   metadata     Json?
   embeddings   Embedding[]
+  story_metadata StoryMetadata[]
   
   @@map("vector_stores")
 }
@@ -37,4 +38,64 @@ model Embedding {
   vector_store    VectorStore @relation(fields: [vector_store_id], references: [id], onDelete: Cascade)
   
   @@map("embeddings")
+}
+
+// Structured tags describing a whole story (one row per vector_store_id +
+// filename, shared by every chunk of that file). Created/maintained via raw
+// SQL in main.py (ensure_story_metadata_table / upsert_story_metadata), but
+// declared here so the schema reflects the actual database structure.
+model StoryMetadata {
+  id                     String      @id @default(cuid())
+  vector_store_id        String
+  filename               String
+  genres                 Json        @default("[]")
+  romance_subgenres      Json        @default("[]")
+  tropes                 Json        @default("[]")
+  relationship_types     Json        @default("[]")
+  character_archetypes   Json        @default("[]")
+  occupations            Json        @default("[]")
+  settings               Json        @default("[]")
+  sports                 Json        @default("[]")
+  military               Json        @default("[]")
+  kinks                  Json        @default("[]")
+  emotional_tone         Json        @default("[]")
+  major_conflicts        Json        @default("[]")
+  content_warnings       Json        @default("[]")
+  search_keywords        Json        @default("[]")
+  tone                   Json        @default("[]")
+  coming_out             Boolean     @default(false)
+  first_love             Boolean     @default(false)
+  forbidden_romance      Boolean     @default(false)
+  found_family           Boolean     @default(false)
+  slow_burn              Boolean     @default(false)
+  enemies_to_lovers      Boolean     @default(false)
+  hurt_comfort           Boolean     @default(false)
+  age_gap                Boolean     @default(false)
+  college                Boolean     @default(false)
+  military_romance       Boolean     @default(false)
+  heat_level             Int         @default(1)
+  pov                    String?
+  explicitness           String?
+  relationship_structure String?
+  ending                 String?
+  created_at             DateTime    @default(now())
+  updated_at             DateTime    @default(now())
+
+  vector_store           VectorStore @relation(fields: [vector_store_id], references: [id], onDelete: Cascade)
+
+  @@unique([vector_store_id, filename])
+  @@index([vector_store_id])
+  @@map("story_metadata")
+}
+
+// Standalone demo table used by examples/basic_usage.py. Not linked to
+// vector_stores/embeddings and not part of the ingest/search API.
+model DemoDocument {
+  id         String   @id
+  content    String
+  metadata   Json     @default("{}")
+  embedding  Unsupported("vector(3)")
+  created_at DateTime @default(now())
+
+  @@map("demo_documents")
 } 

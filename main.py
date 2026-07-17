@@ -26,7 +26,15 @@ from models import (
     EmbeddingBatchCreateRequest,
     EmbeddingBatchCreateResponse,
     VectorStoreListResponse,
-    ContentChunk
+    VectorStoreExposureUpdateRequest,
+    ContentChunk,
+    SceneSearchRequest,
+    SceneSearchResponse,
+    SceneSearchResult,
+    StoryMetadata,
+    StoryMetadataResponse,
+    StoryMetadataBulkUpsertRequest,
+    StoryFileInfo,
 )
 from config import settings
 from embedding_service import embedding_service
@@ -100,6 +108,7 @@ async def require_ui_login(credentials: HTTPBasicCredentials = Depends(ui_securi
 async def startup():
     """Connect to database on startup"""
     await db.connect()
+    await ensure_story_metadata_table()
     record_activity("system", "Server started")
 
 
@@ -138,6 +147,197 @@ def to_unix_timestamp(value):
     if isinstance(value, str):
         return int(datetime.fromisoformat(value).timestamp())
     return int(value)
+
+
+def is_store_exposed(metadata: Optional[dict[str, Any]]) -> bool:
+    """Opt-in flag: a vector store is only reachable via /v1/scenes/search
+    (and the MCP server) once explicitly marked api_exposed=true. Absent or
+    falsy values are treated as NOT exposed."""
+    if not metadata:
+        return False
+    return bool(metadata.get("api_exposed", False))
+
+
+# ── Structured story metadata (genres, tropes, kinks, heat level, etc.) ─────
+STORY_METADATA_TABLE = "story_metadata"
+
+STORY_METADATA_ARRAY_FIELDS = [
+    "genres",
+    "romance_subgenres",
+    "tropes",
+    "relationship_types",
+    "character_archetypes",
+    "occupations",
+    "settings",
+    "sports",
+    "military",
+    "kinks",
+    "emotional_tone",
+    "major_conflicts",
+    "content_warnings",
+    "search_keywords",
+    "tone",
+]
+STORY_METADATA_BOOL_FIELDS = [
+    "coming_out",
+    "first_love",
+    "forbidden_romance",
+    "found_family",
+    "slow_burn",
+    "enemies_to_lovers",
+    "hurt_comfort",
+    "age_gap",
+    "college",
+    "military_romance",
+]
+# pov, explicitness, relationship_structure, ending
+STORY_METADATA_STRING_FIELDS = ["pov", "explicitness", "relationship_structure", "ending"]
+
+
+async def ensure_story_metadata_table() -> None:
+    """Idempotently create the story_metadata table (structured tags shared
+    by every chunk of a given vector_store_id + filename)."""
+    array_columns = ",\n            ".join(
+        f"{field} JSONB NOT NULL DEFAULT '[]'::jsonb" for field in STORY_METADATA_ARRAY_FIELDS
+    )
+    bool_columns = ",\n            ".join(
+        f"{field} BOOLEAN NOT NULL DEFAULT false" for field in STORY_METADATA_BOOL_FIELDS
+    )
+    string_columns = ",\n            ".join(f"{field} TEXT" for field in STORY_METADATA_STRING_FIELDS)
+    vector_store_table = settings.table_names["vector_stores"]
+
+    await db.execute_raw(
+        f"""
+        CREATE TABLE IF NOT EXISTS {STORY_METADATA_TABLE} (
+            id TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+            vector_store_id TEXT NOT NULL REFERENCES {vector_store_table}(id) ON DELETE CASCADE,
+            filename TEXT NOT NULL,
+            {array_columns},
+            {bool_columns},
+            heat_level SMALLINT NOT NULL DEFAULT 1 CHECK (heat_level BETWEEN 1 AND 5),
+            {string_columns},
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE (vector_store_id, filename)
+        )
+        """
+    )
+    await db.execute_raw(
+        f"CREATE INDEX IF NOT EXISTS story_metadata_vector_store_idx "
+        f"ON {STORY_METADATA_TABLE} (vector_store_id)"
+    )
+
+
+def story_metadata_from_row(row: dict[str, Any]) -> StoryMetadata:
+    kwargs: dict[str, Any] = {}
+    for field in STORY_METADATA_ARRAY_FIELDS:
+        kwargs[field] = row.get(field) or []
+    for field in STORY_METADATA_BOOL_FIELDS:
+        kwargs[field] = bool(row.get(field))
+    for field in STORY_METADATA_STRING_FIELDS:
+        kwargs[field] = row.get(field)
+    kwargs["heat_level"] = row.get("heat_level") or 1
+    return StoryMetadata(**kwargs)
+
+
+def story_metadata_response_from_row(row: dict[str, Any]) -> StoryMetadataResponse:
+    base = story_metadata_from_row(row)
+    return StoryMetadataResponse(
+        **base.model_dump(),
+        vector_store_id=row["vector_store_id"],
+        filename=row["filename"],
+        created_at=int(row["created_at_ts"]),
+        updated_at=int(row["updated_at_ts"]),
+    )
+
+
+async def upsert_story_metadata(vector_store_id: str, filename: str, metadata: StoryMetadata) -> dict[str, Any]:
+    columns = (
+        STORY_METADATA_ARRAY_FIELDS
+        + STORY_METADATA_BOOL_FIELDS
+        + ["heat_level"]
+        + STORY_METADATA_STRING_FIELDS
+    )
+    values: list[Any] = [vector_store_id, filename]
+    placeholders = ["$1", "$2"]
+    idx = 3
+
+    for field in STORY_METADATA_ARRAY_FIELDS:
+        placeholders.append(f"${idx}::jsonb")
+        values.append(json.dumps(getattr(metadata, field)))
+        idx += 1
+    for field in STORY_METADATA_BOOL_FIELDS:
+        placeholders.append(f"${idx}")
+        values.append(getattr(metadata, field))
+        idx += 1
+    placeholders.append(f"${idx}")
+    values.append(metadata.heat_level)
+    idx += 1
+    for field in STORY_METADATA_STRING_FIELDS:
+        placeholders.append(f"${idx}")
+        values.append(getattr(metadata, field))
+        idx += 1
+
+    update_clauses = ", ".join(f"{col} = EXCLUDED.{col}" for col in columns) + ", updated_at = NOW()"
+
+    result = await db.query_raw(
+        f"""
+        INSERT INTO {STORY_METADATA_TABLE} (id, vector_store_id, filename, {", ".join(columns)}, created_at, updated_at)
+        VALUES (gen_random_uuid()::text, {", ".join(placeholders)}, NOW(), NOW())
+        ON CONFLICT (vector_store_id, filename)
+        DO UPDATE SET {update_clauses}
+        RETURNING *, EXTRACT(EPOCH FROM created_at)::bigint as created_at_ts,
+                 EXTRACT(EPOCH FROM updated_at)::bigint as updated_at_ts
+        """,
+        *values,
+    )
+    if not result:
+        raise HTTPException(status_code=500, detail="Failed to upsert story metadata")
+    return result[0]
+
+
+def build_tag_filter_sql(tag_filters: dict[str, Any], start_index: int) -> tuple[str, list[Any], int]:
+    """Build a whitelisted SQL WHERE-clause fragment (ANDed conditions) for
+    structured story-metadata filters against the `sm` alias. Raises
+    HTTPException(400) on unrecognized keys so typos surface immediately."""
+    clauses: list[str] = []
+    params: list[Any] = []
+    idx = start_index
+
+    for key, value in tag_filters.items():
+        if key in STORY_METADATA_ARRAY_FIELDS:
+            if not isinstance(value, list) or not value:
+                raise HTTPException(status_code=400, detail=f"tag_filters.{key} must be a non-empty list")
+            clauses.append(f"sm.{key} ?| ${idx}::text[]")
+            params.append([str(v) for v in value])
+            idx += 1
+        elif key in STORY_METADATA_BOOL_FIELDS:
+            clauses.append(f"sm.{key} = ${idx}")
+            params.append(bool(value))
+            idx += 1
+        elif key in STORY_METADATA_STRING_FIELDS:
+            clauses.append(f"sm.{key} = ${idx}")
+            params.append(str(value))
+            idx += 1
+        elif key == "heat_level_min":
+            clauses.append(f"sm.heat_level >= ${idx}")
+            params.append(int(value))
+            idx += 1
+        elif key == "heat_level_max":
+            clauses.append(f"sm.heat_level <= ${idx}")
+            params.append(int(value))
+            idx += 1
+        elif key == "any_keyword":
+            if not isinstance(value, list) or not value:
+                raise HTTPException(status_code=400, detail="tag_filters.any_keyword must be a non-empty list")
+            or_clause = " OR ".join(f"sm.{field} ?| ${idx}::text[]" for field in STORY_METADATA_ARRAY_FIELDS)
+            clauses.append(f"({or_clause})")
+            params.append([str(v) for v in value])
+            idx += 1
+        else:
+            raise HTTPException(status_code=400, detail=f"Unknown tag_filters key: {key}")
+
+    return " AND ".join(clauses), params, idx
 
 
 def chunk_text(text: str, max_chars: int = 1600, overlap: int = 200) -> list[str]:
@@ -384,7 +584,8 @@ async def create_vector_store(
             expires_after=vector_store["expires_after"],
             expires_at=expires_at,
             last_active_at=last_active_at,
-            metadata=vector_store["metadata"]
+            metadata=vector_store["metadata"],
+            api_exposed=is_store_exposed(vector_store["metadata"]),
         )
         
     except Exception as e:
@@ -459,7 +660,8 @@ async def list_vector_stores(
                 expires_after=row["expires_after"],
                 expires_at=expires_at,
                 last_active_at=last_active_at,
-                metadata=row["metadata"]
+                metadata=row["metadata"],
+                api_exposed=is_store_exposed(row["metadata"]),
             )
             vector_stores.append(vector_store)
         
@@ -478,6 +680,285 @@ async def list_vector_stores(
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Failed to list vector stores: {str(e)}")
+
+
+@app.patch("/v1/vector_stores/{vector_store_id}/exposure", response_model=VectorStoreResponse)
+async def update_vector_store_exposure(
+    vector_store_id: str,
+    request: VectorStoreExposureUpdateRequest,
+    api_key: str = Depends(get_api_key)
+):
+    """
+    Enable or disable a vector store for the public /v1/scenes/search API and
+    the MCP server. Stores are opt-in: this must be explicitly set to true
+    before a store is reachable through that surface.
+    """
+    vector_store_table = settings.table_names["vector_stores"]
+    try:
+        existing = await db.query_raw(
+            f"SELECT id, name, metadata FROM {vector_store_table} WHERE id = $1",
+            vector_store_id,
+        )
+        if not existing:
+            raise HTTPException(status_code=404, detail="Vector store not found")
+
+        merged_metadata = dict(existing[0]["metadata"] or {})
+        merged_metadata["api_exposed"] = request.api_exposed
+
+        result = await db.query_raw(
+            f"""
+            UPDATE {vector_store_table}
+            SET metadata = $2::jsonb, last_active_at = NOW()
+            WHERE id = $1
+            RETURNING id, name, file_counts, status, usage_bytes, expires_after, expires_at, last_active_at, metadata,
+                     EXTRACT(EPOCH FROM created_at)::bigint as created_at_timestamp
+            """,
+            vector_store_id,
+            json.dumps(merged_metadata),
+        )
+        if not result:
+            raise HTTPException(status_code=500, detail="Failed to update vector store exposure")
+
+        row = result[0]
+        record_activity(
+            "exposure_updated",
+            f"Store '{row['name']}' api_exposed set to {request.api_exposed}",
+            vector_store_id=row["id"],
+            store_name=row["name"],
+            api_exposed=request.api_exposed,
+        )
+
+        return VectorStoreResponse(
+            id=row["id"],
+            created_at=int(row["created_at_timestamp"]),
+            name=row["name"],
+            usage_bytes=row["usage_bytes"] or 0,
+            file_counts=row["file_counts"] or {"in_progress": 0, "completed": 0, "failed": 0, "cancelled": 0, "total": 0},
+            status=row["status"],
+            expires_after=row["expires_after"],
+            expires_at=to_unix_timestamp(row.get("expires_at")),
+            last_active_at=to_unix_timestamp(row.get("last_active_at")),
+            metadata=row["metadata"],
+            api_exposed=is_store_exposed(row["metadata"]),
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to update vector store exposure: {str(e)}")
+
+
+@app.get("/v1/vector_stores/{vector_store_id}/stories", response_model=List[StoryFileInfo])
+async def list_story_files(
+    vector_store_id: str,
+    api_key: str = Depends(get_api_key),
+):
+    """
+    List distinct story files uploaded to a vector store, with chunk counts
+    and (if present) their structured metadata tags.
+    """
+    fields = settings.db_fields
+    table_name = settings.table_names["embeddings"]
+
+    file_rows = await db.query_raw(
+        f"""
+        SELECT {fields.metadata_field}->>'filename' as filename, COUNT(*) as chunk_count
+        FROM {table_name}
+        WHERE {fields.vector_store_id_field} = $1
+        GROUP BY {fields.metadata_field}->>'filename'
+        ORDER BY filename
+        """,
+        vector_store_id,
+    )
+
+    meta_rows = await db.query_raw(
+        f"SELECT * FROM {STORY_METADATA_TABLE} WHERE vector_store_id = $1",
+        vector_store_id,
+    )
+    meta_by_filename = {row["filename"]: row for row in meta_rows}
+
+    return [
+        StoryFileInfo(
+            filename=row["filename"] or "document.txt",
+            chunk_count=int(row["chunk_count"]),
+            has_metadata=(row["filename"] in meta_by_filename),
+            metadata=(
+                story_metadata_from_row(meta_by_filename[row["filename"]])
+                if row["filename"] in meta_by_filename
+                else None
+            ),
+        )
+        for row in file_rows
+    ]
+
+
+@app.get("/v1/vector_stores/{vector_store_id}/stories/{filename}/metadata", response_model=StoryMetadataResponse)
+async def get_story_metadata(
+    vector_store_id: str,
+    filename: str,
+    api_key: str = Depends(get_api_key),
+):
+    """Fetch the structured tags for a single story."""
+    result = await db.query_raw(
+        f"""
+        SELECT *, EXTRACT(EPOCH FROM created_at)::bigint as created_at_ts,
+               EXTRACT(EPOCH FROM updated_at)::bigint as updated_at_ts
+        FROM {STORY_METADATA_TABLE}
+        WHERE vector_store_id = $1 AND filename = $2
+        """,
+        vector_store_id,
+        filename,
+    )
+    if not result:
+        raise HTTPException(status_code=404, detail="No structured metadata for this story yet")
+    return story_metadata_response_from_row(result[0])
+
+
+@app.put("/v1/vector_stores/{vector_store_id}/stories/{filename}/metadata", response_model=StoryMetadataResponse)
+async def set_story_metadata(
+    vector_store_id: str,
+    filename: str,
+    request: StoryMetadata,
+    api_key: str = Depends(get_api_key),
+):
+    """Create or replace the structured tags (genres, tropes, kinks, heat
+    level, POV, tone, explicitness, relationship structure, ending, etc.)
+    for a single story."""
+    vector_store_table = settings.table_names["vector_stores"]
+    existing = await db.query_raw(f"SELECT id FROM {vector_store_table} WHERE id = $1", vector_store_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Vector store not found")
+
+    row = await upsert_story_metadata(vector_store_id, filename, request)
+    return story_metadata_response_from_row(row)
+
+
+@app.post("/v1/vector_stores/{vector_store_id}/stories/metadata/bulk")
+async def bulk_set_story_metadata(
+    vector_store_id: str,
+    request: StoryMetadataBulkUpsertRequest,
+    api_key: str = Depends(get_api_key),
+):
+    """Bulk create/replace structured tags for many stories at once, e.g.
+    output from an offline tagging pass. Body: {"items": {"<filename>": {...tags...}}}."""
+    vector_store_table = settings.table_names["vector_stores"]
+    existing = await db.query_raw(f"SELECT id FROM {vector_store_table} WHERE id = $1", vector_store_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Vector store not found")
+
+    updated_files = []
+    for filename, metadata in request.items.items():
+        await upsert_story_metadata(vector_store_id, filename, metadata)
+        updated_files.append(filename)
+
+    return {"vector_store_id": vector_store_id, "updated_files": updated_files, "count": len(updated_files)}
+
+
+@app.post("/v1/scenes/search", response_model=SceneSearchResponse)
+async def search_scenes(
+    request: SceneSearchRequest,
+    api_key: str = Depends(get_api_key)
+):
+    """
+    Cross-store natural-language scene search, e.g. "a scene with a military
+    guy in it". Only searches vector stores explicitly opted in via
+    api_exposed=true (see PATCH /v1/vector_stores/{id}/exposure). This is the
+    intended entry point for other applications and the MCP server.
+    """
+    try:
+        vector_store_table = settings.table_names["vector_stores"]
+        exposed_rows = await db.query_raw(
+            f"SELECT id, name, metadata FROM {vector_store_table}"
+        )
+        exposed_ids_by_id = {
+            row["id"]: row["name"]
+            for row in exposed_rows
+            if is_store_exposed(row["metadata"])
+        }
+
+        if request.vector_store_ids:
+            requested = set(request.vector_store_ids)
+            target_ids = [store_id for store_id in requested if store_id in exposed_ids_by_id]
+        else:
+            target_ids = list(exposed_ids_by_id.keys())
+
+        if not target_ids:
+            return SceneSearchResponse(search_query=request.query, data=[], has_more=False)
+
+        query_embedding = await generate_query_embedding(request.query)
+        query_vector_str = "[" + ",".join(map(str, query_embedding)) + "]"
+
+        limit = min(request.limit or 10, 100)
+        fields = settings.db_fields
+        table_name = settings.table_names["embeddings"]
+
+        query_params: list[Any] = [query_vector_str, target_ids]
+        next_index = 3
+        extra_where = ""
+        if request.tag_filters:
+            tag_clause, tag_params, next_index = build_tag_filter_sql(request.tag_filters, next_index)
+            if tag_clause:
+                extra_where = f" AND {tag_clause}"
+            query_params.extend(tag_params)
+
+        limit_index = next_index
+        query_params.append(limit)
+
+        results = await db.query_raw(
+            f"""
+            SELECT
+                e.{fields.id_field} as id,
+                e.{fields.vector_store_id_field} as vector_store_id,
+                e.{fields.content_field} as content,
+                e.{fields.metadata_field} as metadata,
+                (e.{fields.embedding_field} <=> $1::vector) as distance,
+                sm.id as sm_id,
+                sm.genres, sm.romance_subgenres, sm.tropes, sm.relationship_types,
+                sm.character_archetypes, sm.occupations, sm.settings, sm.sports,
+                sm.military, sm.kinks, sm.emotional_tone, sm.major_conflicts,
+                sm.coming_out, sm.first_love, sm.forbidden_romance, sm.found_family,
+                sm.slow_burn, sm.enemies_to_lovers, sm.hurt_comfort, sm.age_gap,
+                sm.college, sm.military_romance, sm.heat_level, sm.content_warnings,
+                sm.search_keywords, sm.pov, sm.tone, sm.explicitness,
+                sm.relationship_structure, sm.ending
+            FROM {table_name} e
+            LEFT JOIN {STORY_METADATA_TABLE} sm
+                ON sm.vector_store_id = e.{fields.vector_store_id_field}
+               AND sm.filename = e.{fields.metadata_field}->>'filename'
+            WHERE e.{fields.vector_store_id_field} = ANY($2::text[]){extra_where}
+            ORDER BY distance ASC
+            LIMIT ${limit_index}
+            """,
+            *query_params,
+        )
+
+        search_results = []
+        for row in results:
+            similarity_score = max(0, 1 - (row["distance"] / 2))
+            metadata = row["metadata"] or {}
+            filename = metadata.get("filename", "document.txt")
+            store_id = row["vector_store_id"]
+
+            search_results.append(
+                SceneSearchResult(
+                    vector_store_id=store_id,
+                    vector_store_name=exposed_ids_by_id.get(store_id, "unknown"),
+                    file_id=row["id"],
+                    filename=filename,
+                    score=similarity_score,
+                    attributes=metadata if request.return_metadata else None,
+                    content=[ContentChunk(type="text", text=row["content"])],
+                    story_metadata=story_metadata_from_row(row) if row.get("sm_id") else None,
+                )
+            )
+
+        return SceneSearchResponse(search_query=request.query, data=search_results, has_more=False)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Scene search failed: {str(e)}")
 
 
 @app.post("/v1/vector_stores/{vector_store_id}/search", response_model=VectorStoreSearchResponse)

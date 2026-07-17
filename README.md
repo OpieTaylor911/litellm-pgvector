@@ -250,6 +250,18 @@ The application uses two main tables:
 - `metadata` (json, optional)
 - `created_at` (timestamp)
 
+### story_metadata
+Structured per-file tags for the story-ingest workflow (one row per `vector_store_id` + `filename`, cascades on vector store delete):
+- `id` (string, primary key)
+- `vector_store_id` (string, foreign key, `onDelete: Cascade`)
+- `filename` (string, unique together with `vector_store_id`)
+- Tag arrays (json lists of strings): `genres`, `romance_subgenres`, `tropes`, `relationship_types`, `character_archetypes`, `occupations`, `settings`, `sports`, `military`, `kinks`, `emotional_tone`, `major_conflicts`, `content_warnings`, `search_keywords`, `tone`
+- Trope booleans: `coming_out`, `first_love`, `forbidden_romance`, `found_family`, `slow_burn`, `enemies_to_lovers`, `hurt_comfort`, `age_gap`, `college`, `military_romance`
+- Scalars: `heat_level` (int 1-5), `pov`, `explicitness`, `relationship_structure`, `ending` (all nullable strings)
+- `created_at` / `updated_at` (timestamp)
+
+Managed through `GET/PUT /v1/vector_stores/{id}/stories/{filename}/metadata` and `POST /v1/vector_stores/{id}/stories/metadata/bulk` — see [Manual Ingest & Metadata Workflow](#manual-ingest--metadata-workflow) below.
+
 ## Supported Models
 
 Any embedding model supported by LiteLLM proxy can be used. Examples:
@@ -415,6 +427,95 @@ response = requests.post(
 )
 
 print(f"Migrated {len(embeddings)} embeddings")
+```
+
+## Manual Ingest & Metadata Workflow
+
+Besides the web UI, several standalone scripts in this directory can ingest stories and/or attach
+structured metadata tags directly against the running API (default `http://127.0.0.1:18001`). All
+of them read defaults from `litellm-pgvector/.env` (or `../.env`) — set `SERVER_API_KEY`,
+`STORY_METADATA_API_BASE`/`STORY_METADATA_API_KEY`, and `STORY_METADATA_LLM_*` there so you don't
+have to pass everything on the command line.
+
+### 1. Bulk-sync a folder tree of stories (`scripts/sync_fiction_vectorstores.py`)
+
+Syncs `<fiction-root>/<topic>/source/*.txt` into one vector store per topic (creating stores as
+needed), re-uploading text via `upload-text-files`. Re-running against a topic clears that store's
+existing `embeddings` **and** `story_metadata` rows first (via `--database-url`), so stale tags
+from removed/renamed files don't linger:
+
+```bash
+cd litellm-pgvector
+python3 scripts/sync_fiction_vectorstores.py \
+  --fiction-root /mnt/commandjobs/fiction \
+  --api-base http://127.0.0.1:18001 \
+  --api-key "$SERVER_API_KEY" \
+  --database-url "$DATABASE_URL" \
+  --dry-run   # drop --dry-run to actually sync
+```
+
+Writes a `topic -> vector_store_id` mapping to `--mapping-file` (default
+`/mnt/commandjobs/fiction/.vectorstore_ids.json`).
+
+### 2. Extract + upload metadata for one story (`story_metadata_extractor.py`)
+
+Runs an LLM extraction pass over a single `.txt` file against the `StoryMetadata` schema
+(`models.py`) and, with `--upload`, `PUT`s the result to
+`/v1/vector_stores/{vector_store_id}/stories/{filename}/metadata`:
+
+```bash
+python3 story_metadata_extractor.py path/to/story.txt \
+  --vector-store-id vs_abc123 \
+  --upload \
+  --output extracted.json
+```
+
+### 3. Batch-extract metadata for a whole directory (`story_metadata_batch_runner.py`)
+
+Same extraction as above, run over every `.txt` file in a directory, writing one JSON file per
+story and optionally uploading each:
+
+```bash
+python3 story_metadata_batch_runner.py path/to/story-dir \
+  --output-dir extracted-story-metadata \
+  --vector-store-id vs_abc123 \
+  --upload \
+  --limit 50   # 0 = no limit
+```
+
+### 4. Full 3-part ingest prototype (`story_ingest_orchestrator.py`)
+
+Runs scene splitting, story-graph extraction, and whole-story metadata extraction together for one
+file or a directory, writing `metadata.json` / `scenes.json` / `graph.json` per story under
+`--output-dir`, with the same `--upload`/`--vector-store-id` metadata upload option:
+
+```bash
+python3 story_ingest_orchestrator.py path/to/story-dir \
+  --output-dir story-ingest-output \
+  --model gpt-4.1-mini \
+  --upload --vector-store-id vs_abc123
+```
+
+### 5. Spot-check extracted tags (`story_metadata_qa_sample.py`)
+
+Prints a random sample of already-extracted JSON files (from either batch script above) for manual
+QA before/instead of uploading:
+
+```bash
+python3 story_metadata_qa_sample.py extracted-story-metadata --count 10
+```
+
+### 6. Bulk-upsert pre-tagged metadata
+
+If tags were generated offline (e.g. from an external tagging pass), push them directly without
+re-running extraction, one request per vector store:
+
+```bash
+curl -X POST \
+  http://127.0.0.1:18001/v1/vector_stores/vs_abc123/stories/metadata/bulk \
+  -H "Authorization: Bearer $SERVER_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"items": {"story-one.txt": {"genres": ["romance"], "heat_level": 3}}}'
 ```
 
 ## License
