@@ -27,6 +27,7 @@ DEFAULT_API_KEY = os.environ.get("STORY_METADATA_API_KEY", os.environ.get("SERVE
 DEFAULT_LLM_MODEL = os.environ.get("STORY_METADATA_LLM_MODEL", "custom_openai/qwen/qwen3.6-27b")
 DEFAULT_LLM_API_BASE = os.environ.get("STORY_METADATA_LLM_API_BASE", os.environ.get("EMBEDDING__BASE_URL", "http://192.168.254.66:4000"))
 DEFAULT_LLM_API_KEY = os.environ.get("STORY_METADATA_LLM_API_KEY", os.environ.get("EMBEDDING__API_KEY", "sk-oW1ZHol1wBXa0oRR0OQBlA"))
+DEFAULT_LLM_TIMEOUT_SECONDS = float(os.environ.get("STORY_METADATA_LLM_TIMEOUT_SECONDS", "35"))
 
 
 PROMPT_TEMPLATE = """You are extracting structured ROMANCE FICTION metadata for ONE COMPLETE STORY.
@@ -101,7 +102,14 @@ def build_prompt(filename: str, story_text: str) -> str:
     )
 
 
-async def extract_story_metadata(filename: str, story_text: str, model: str, api_base: str, api_key: str) -> StoryMetadata:
+async def extract_story_metadata(
+    filename: str,
+    story_text: str,
+    model: str,
+    api_base: str,
+    api_key: str,
+    timeout_seconds: float = DEFAULT_LLM_TIMEOUT_SECONDS,
+) -> StoryMetadata:
     prompt = build_prompt(filename, story_text)
     response = await litellm.acompletion(
         model=model,
@@ -112,18 +120,34 @@ async def extract_story_metadata(filename: str, story_text: str, model: str, api
             {"role": "user", "content": prompt},
         ],
         temperature=0.1,
+        timeout=timeout_seconds,
     )
     content = response.choices[0].message.content or "{}"
     parsed = json.loads(strip_code_fences(content))
     return StoryMetadata.model_validate(parsed)
 
 
-async def extract_with_retry(filename: str, story_text: str, model: str, api_base: str, api_key: str, retries: int = 2) -> StoryMetadata:
+async def extract_with_retry(
+    filename: str,
+    story_text: str,
+    model: str,
+    api_base: str,
+    api_key: str,
+    retries: int = 2,
+    timeout_seconds: float = DEFAULT_LLM_TIMEOUT_SECONDS,
+) -> StoryMetadata:
     last_error: Exception | None = None
     for attempt in range(retries + 1):
         try:
-            return await extract_story_metadata(filename, story_text, model, api_base, api_key)
-        except (json.JSONDecodeError, ValidationError, KeyError, TypeError, ValueError) as exc:
+            return await extract_story_metadata(
+                filename,
+                story_text,
+                model,
+                api_base,
+                api_key,
+                timeout_seconds=timeout_seconds,
+            )
+        except Exception as exc:
             last_error = exc
             if attempt >= retries:
                 raise RuntimeError(f"Structured extraction failed after {retries + 1} attempts: {exc}") from exc

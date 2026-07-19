@@ -365,16 +365,6 @@
               <input type="checkbox" id="extract-metadata" checked>
               Extract metadata
             </label>
-            <div class="row">
-              <label style="grid-template-columns:1fr;">
-                LLM API Base
-                <input id="llm-api-base" value="http://192.168.254.66:4000" autocomplete="off">
-              </label>
-              <label style="grid-template-columns:1fr;">
-                Model
-                <input id="llm-model" value="custom_openai/qwen3.6-27b" autocomplete="off">
-              </label>
-            </div>
           </div>
         </div>
 
@@ -625,66 +615,20 @@
     }
 
     // Metadata extraction helper
-    async function extractMetadata(filename, text, model, apiBase, apiKey) {
-      const prompt = `You are extracting structured ROMANCE FICTION metadata for ONE COMPLETE STORY.
-
-Return ONLY valid JSON matching this schema exactly. No markdown. No explanation.
-
-Rules:
-- Analyze the ENTIRE story, not just one scene.
-- Use only evidence present in the text. If unknown, leave arrays empty, booleans false, strings null, and heat_level=1.
-- Normalize tags to short lowercase phrases except fixed enums like HEA/HFN.
-- Keep arrays deduplicated.
-- search_keywords should contain the best retrieval phrases a reader would search for.
-- tone may contain multiple values from: wholesome, emotional, erotic, suspenseful, humorous.
-- pov must be one of: dual, first person, third person, or null.
-- explicitness must be one of: kissing, fade to black, explicit, very explicit, or null.
-- relationship_structure must be one of: monogamous, open, poly, or null.
-- ending must be one of: HEA, HFN, or null.
-- heat_level must be an integer from 1 to 5.
-
-Story filename: ${filename}
-
-Story text:
-${text.substring(0, 20000)}`;
-
+    async function extractMetadata(filename, text) {
       try {
-        const response = await fetch(`${apiBase.replace(/\/+$/, '')}/v1/chat/completions`, {
+        const response = await fetch('/v1/stories/metadata/extract', {
           method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${apiKey}`,
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify({
-            model: model,
-            messages: [
-              { role: 'system', content: 'Return only valid JSON matching the requested schema.' },
-              { role: 'user', content: prompt }
-            ],
-            temperature: 0.1
-          })
+          headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+          body: JSON.stringify({ filename, text })
         });
 
         if (!response.ok) {
-          throw new Error(`LLM API error: ${response.status} - ${response.statusText}`);
+          const payload = await readResponsePayload(response);
+          throw new Error(payload?.detail || `Metadata API error: ${response.status}`);
         }
 
-        const data = await response.json();
-        const content = data.choices?.[0]?.message?.content || '{}';
-        
-        // Strip code fences
-        let cleaned = content.trim();
-        if (cleaned.startsWith('```')) {
-          const lines = cleaned.split('\n');
-          if (lines.length > 1) {
-            cleaned = lines.slice(1).join('\n');
-          }
-          if (cleaned.endsWith('```')) {
-            cleaned = cleaned.slice(0, -3);
-          }
-        }
-        
-        return JSON.parse(cleaned.trim());
+        return await response.json();
       } catch (error) {
         console.error(`Metadata extraction failed for ${filename}:`, error);
         throw error;
@@ -761,9 +705,7 @@ ${text.substring(0, 20000)}`;
 
         // Extract metadata extraction settings
         const shouldExtractMetadata = document.getElementById('extract-metadata').checked;
-        const llmApiBase = document.getElementById('llm-api-base').value.trim() || 'http://127.0.0.1:4000';
-        const llmModel = document.getElementById('llm-model').value.trim() || 'gpt-4.1-mini';
-        const llmApiKey = apiKeyInput.value.trim();
+        // LLM config is now managed via .env file (EMBEDDING__BASE_URL, EMBEDDING__MODEL, etc.)
 
         while (true) {
           const { done, value } = await reader.read();
@@ -807,8 +749,7 @@ ${text.substring(0, 20000)}`;
                   if (file) {
                     const text = await file.text();
                     
-                    // Extract metadata using LLM
-                    const metadata = await extractMetadata(event.filename, text, llmModel, llmApiBase, llmApiKey);
+                    const metadata = await extractMetadata(event.filename, text);
                     extractedMetadata[event.filename] = metadata;
                     
                     appendLog(`Successfully extracted metadata for ${event.filename}`);

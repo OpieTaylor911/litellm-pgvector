@@ -518,6 +518,30 @@ curl -X POST \
   -d '{"items": {"story-one.txt": {"genres": ["romance"], "heat_level": 3}}}'
 ```
 
+### 7. Incremental sync: only new stories (`scripts/sync_new_fiction_stories.sh`)
+
+If you want to ingest only new `.txt` files and skip anything already recorded in
+`story_metadata`, use the shell script below. It treats each `<fiction-root>/<topic>/source`
+directory as a same-named vector store, creates missing stores, and uploads only filenames that do
+not already exist in that store:
+
+```bash
+cd /opt/pgvector/litellm-pgvector
+chmod +x scripts/sync_new_fiction_stories.sh
+
+API_KEY="$SERVER_API_KEY" \
+DATABASE_URL="$DATABASE_URL" \
+FIC_ROOT=/mnt/commandjobs/fiction \
+scripts/sync_new_fiction_stories.sh
+```
+
+Optional environment variables:
+
+- `API_BASE` - API URL, default `http://127.0.0.1:18001`
+- `CHUNK_SIZE` - default `1600`
+- `CHUNK_OVERLAP` - default `200`
+- `SKIP_EMPTY` - set to `0` to create stores for empty source folders without uploading files
+
 ## License
 
 MIT License

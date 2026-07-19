@@ -145,6 +145,11 @@ class StoryMetadataBulkUpsertRequest(BaseModel):
     items: Dict[str, StoryMetadata]
 
 
+class StoryMetadataExtractionRequest(BaseModel):
+    filename: str
+    text: str
+
+
 class StoryFileInfo(BaseModel):
     filename: str
     chunk_count: int

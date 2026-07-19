@@ -34,10 +34,12 @@ from models import (
     StoryMetadata,
     StoryMetadataResponse,
     StoryMetadataBulkUpsertRequest,
+    StoryMetadataExtractionRequest,
     StoryFileInfo,
 )
 from config import settings
 from embedding_service import embedding_service
+from story_metadata_extractor import extract_with_retry
 
 load_dotenv()
 
@@ -296,6 +298,143 @@ async def upsert_story_metadata(vector_store_id: str, filename: str, metadata: S
     return result[0]
 
 
+async def upsert_default_story_metadata_rows(vector_store_id: str, filenames: list[str]) -> int:
+    """Ensure each uploaded filename has a structured metadata row.
+
+    Upload routes always write chunk-level embedding metadata, but callers also
+    expect per-story rows in story_metadata to exist immediately after upload.
+    """
+    unique_filenames = sorted({name for name in filenames if name})
+    for filename in unique_filenames:
+        await upsert_story_metadata(vector_store_id, filename, StoryMetadata())
+    return len(unique_filenames)
+
+
+async def upsert_story_metadata_rows(vector_store_id: str, items: dict[str, StoryMetadata]) -> int:
+    """Upsert one structured metadata payload per filename for a vector store."""
+    count = 0
+    for filename in sorted(items.keys()):
+        if not filename:
+            continue
+        await upsert_story_metadata(vector_store_id, filename, items[filename])
+        count += 1
+    return count
+
+
+def is_default_story_metadata(metadata: StoryMetadata) -> bool:
+    return metadata.model_dump() == StoryMetadata().model_dump()
+
+
+def infer_story_metadata_from_text(filename: str, text: str, vector_store_name: str | None = None) -> StoryMetadata:
+    """Heuristic fallback when LLM extraction is unavailable.
+
+    Produces lightweight but useful structured tags from filename/store context
+    and a small text sample so story_metadata isn't left empty.
+    """
+    store_hint = (vector_store_name or "").replace("-", " ").strip().lower()
+    filename_hint = Path(filename).stem.replace("-", " ").replace("_", " ").lower()
+    sample = text[:20000].lower()
+    scan = f"{store_hint}\n{filename_hint}\n{sample}"
+
+    def has_any(terms: list[str]) -> bool:
+        return any(term in scan for term in terms)
+
+    genres: list[str] = []
+    settings_tags: list[str] = []
+    military_tags: list[str] = []
+    relationship_types: list[str] = []
+    search_keywords: list[str] = []
+
+    if has_any(["romance", "love", "boyfriend", "relationship", "fall in love"]):
+        genres.append("romance")
+
+    if has_any(["gay", "m/m", "male male", "two men", "boyfriend", "husband"]):
+        relationship_types.append("male/male")
+
+    if has_any(["military", "army", "navy", "marine", "air force", "soldier", "barracks"]):
+        settings_tags.append("military")
+
+    branch_terms = {
+        "army": ["army", "soldier", "infantry", "barracks"],
+        "navy": ["navy", "sailor", "ship", "submarine"],
+        "air force": ["air force", "pilot", "airman", "flight line"],
+        "marines": ["marine", "marines", "corps"],
+    }
+    for label, terms in branch_terms.items():
+        if has_any(terms):
+            military_tags.append(label)
+
+    explicit_hits = sum(
+        1
+        for token in ["sex", "cock", "cum", "blowjob", "fuck", "orgasm", "hardon", "anal"]
+        if token in scan
+    )
+    if explicit_hits >= 5:
+        heat_level = 5
+        explicitness = "very explicit"
+    elif explicit_hits >= 3:
+        heat_level = 4
+        explicitness = "explicit"
+    elif explicit_hits >= 1:
+        heat_level = 3
+        explicitness = "explicit"
+    else:
+        heat_level = 2 if "kiss" in scan else 1
+        explicitness = "kissing" if "kiss" in scan else None
+
+    if store_hint:
+        search_keywords.append(store_hint)
+    if genres and settings_tags:
+        search_keywords.append(f"{settings_tags[0]} {genres[0]}")
+    if military_tags:
+        search_keywords.extend(f"{branch} romance" for branch in military_tags[:2])
+    if filename_hint:
+        search_keywords.append(filename_hint)
+
+    return StoryMetadata(
+        genres=sorted(set(genres)),
+        relationship_types=sorted(set(relationship_types)),
+        settings=sorted(set(settings_tags)),
+        military=sorted(set(military_tags)),
+        military_romance=("romance" in genres and "military" in settings_tags),
+        heat_level=heat_level,
+        explicitness=explicitness,
+        search_keywords=sorted(set(search_keywords)),
+    )
+
+
+async def extract_story_metadata_for_upload(
+    filename: str,
+    text: str,
+    vector_store_name: str | None = None,
+) -> StoryMetadata:
+    """Best-effort metadata extraction for upload flows.
+
+    Falls back to default StoryMetadata on extraction failures so uploads can
+    continue even when the metadata model is unavailable.
+    """
+    try:
+        extracted = await extract_with_retry(
+            filename=filename,
+            story_text=text,
+            model=settings.story_metadata_llm_model,
+            api_base=settings.story_metadata_llm_api_base or settings.embedding.base_url,
+            api_key=settings.story_metadata_llm_api_key or settings.embedding.api_key,
+            retries=0,
+        )
+        if is_default_story_metadata(extracted):
+            return infer_story_metadata_from_text(filename, text, vector_store_name)
+        return extracted
+    except Exception as exc:
+        record_activity(
+            "story_metadata_extraction_failed",
+            f"Metadata extraction failed for {filename}; using heuristic fallback",
+            filename=filename,
+            error=str(exc),
+        )
+        return infer_story_metadata_from_text(filename, text, vector_store_name)
+
+
 def build_tag_filter_sql(tag_filters: dict[str, Any], start_index: int) -> tuple[str, list[Any], int]:
     """Build a whitelisted SQL WHERE-clause fragment (ANDed conditions) for
     structured story-metadata filters against the `sm` alias. Raises
@@ -387,7 +526,7 @@ async def create_vector_store_record(
     result = await db.query_raw(
         f"""
         INSERT INTO {vector_store_table} (id, name, file_counts, status, usage_bytes, expires_after, metadata, created_at)
-        VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, NOW())
+        VALUES (gen_random_uuid()::text, $1, $2, $3, $4, $5, $6, NOW())
         RETURNING id, name, file_counts, status, usage_bytes, expires_after, expires_at, last_active_at, metadata,
                  EXTRACT(EPOCH FROM created_at)::bigint as created_at_timestamp
         """,
@@ -415,7 +554,7 @@ async def get_vector_store_id_or_create(
         )
         if not result:
             raise HTTPException(status_code=404, detail="Vector store not found")
-        return vector_store_id, result[0]["name"], False
+        return str(vector_store_id), result[0]["name"], False
 
     cleaned_name = (vector_store_name or "").strip()
     if not cleaned_name:
@@ -428,7 +567,7 @@ async def get_vector_store_id_or_create(
         cleaned_name,
         metadata={"created_via": "upload_ui"},
     )
-    return vector_store["id"], vector_store["name"], True
+    return str(vector_store["id"]), vector_store["name"], True
 
 
 def _sanitize_path_segment(value: str) -> str:
@@ -485,7 +624,7 @@ async def insert_embeddings_records(
         for embedding_req in batch_embeddings:
             embedding_vector_str = "[" + ",".join(map(str, embedding_req.embedding)) + "]"
             values_clauses.append(
-                f"(gen_random_uuid(), ${param_count}, ${param_count + 1}, ${param_count + 2}::vector, ${param_count + 3}, NOW())"
+                f"(gen_random_uuid(), ${param_count}, ${param_count + 1}, ${param_count + 2}::halfvec, ${param_count + 3}, NOW())"
             )
             params.extend([
                 vector_store_id,
@@ -853,6 +992,24 @@ async def bulk_set_story_metadata(
     return {"vector_store_id": vector_store_id, "updated_files": updated_files, "count": len(updated_files)}
 
 
+@app.post("/v1/stories/metadata/extract", response_model=StoryMetadata)
+async def extract_story_metadata_for_ui(
+    request: StoryMetadataExtractionRequest,
+    api_key: str = Depends(get_api_key),
+):
+    """Extract structured story metadata using server-side LiteLLM settings."""
+    try:
+        return await extract_with_retry(
+            filename=request.filename,
+            story_text=request.text,
+            model=settings.story_metadata_llm_model,
+            api_base=settings.story_metadata_llm_api_base or settings.embedding.base_url,
+            api_key=settings.story_metadata_llm_api_key or settings.embedding.api_key,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Metadata extraction failed: {str(exc)}")
+
+
 @app.post("/v1/scenes/search", response_model=SceneSearchResponse)
 async def search_scenes(
     request: SceneSearchRequest,
@@ -910,7 +1067,7 @@ async def search_scenes(
                 e.{fields.vector_store_id_field} as vector_store_id,
                 e.{fields.content_field} as content,
                 e.{fields.metadata_field} as metadata,
-                (e.{fields.embedding_field} <=> $1::vector) as distance,
+                (e.{fields.embedding_field} <=> $1::halfvec) as distance,
                 sm.id as sm_id,
                 sm.genres, sm.romance_subgenres, sm.tropes, sm.relationship_types,
                 sm.character_archetypes, sm.occupations, sm.settings, sm.sports,
@@ -1002,7 +1159,7 @@ async def search_vector_store(
             {fields.id_field},
             {fields.content_field},
             {fields.metadata_field},
-            ({fields.embedding_field} <=> ${param_count}::vector) as distance
+            ({fields.embedding_field} <=> ${param_count}::halfvec) as distance
         FROM {table_name} 
         WHERE {fields.vector_store_id_field} = ${param_count + 1}
         """
@@ -1093,7 +1250,7 @@ async def create_embedding(
             f"""
             INSERT INTO {table_name} ({fields.id_field}, {fields.vector_store_id_field}, {fields.content_field}, 
                                      {fields.embedding_field}, {fields.metadata_field}, {fields.created_at_field})
-            VALUES (gen_random_uuid(), $1, $2, $3::vector, $4, NOW())
+            VALUES (gen_random_uuid(), $1, $2, $3::halfvec, $4, NOW())
             RETURNING {fields.id_field}, {fields.vector_store_id_field}, {fields.content_field}, 
                      {fields.metadata_field}, EXTRACT(EPOCH FROM {fields.created_at_field})::bigint as created_at_timestamp
             """,
@@ -1211,6 +1368,7 @@ async def upload_text_files(
 
     embedding_requests: list[EmbeddingCreateRequest] = []
     file_summaries: list[dict[str, Any]] = []
+    extracted_story_metadata: dict[str, StoryMetadata] = {}
 
     for upload in files:
         if not upload.filename:
@@ -1230,6 +1388,12 @@ async def upload_text_files(
             text = raw_bytes.decode("utf-8")
         except UnicodeDecodeError:
             text = raw_bytes.decode("utf-8-sig", errors="replace")
+
+        extracted_story_metadata[upload.filename] = await extract_story_metadata_for_upload(
+            upload.filename,
+            text,
+            resolved_vector_store_name,
+        )
 
         chunks = chunk_text(text, max_chars=chunk_size, overlap=chunk_overlap)
         if not chunks:
@@ -1284,6 +1448,7 @@ async def upload_text_files(
         resolved_vector_store_id,
         embedding_requests,
     )
+    metadata_rows_upserted = await upsert_story_metadata_rows(resolved_vector_store_id, extracted_story_metadata)
     record_activity(
         "upload_completed",
         f"Upload completed for store '{resolved_vector_store_name}'",
@@ -1291,6 +1456,7 @@ async def upload_text_files(
         store_name=resolved_vector_store_name,
         files_processed=len(file_summaries),
         embeddings_created=len(created_embeddings),
+        story_metadata_rows_upserted=metadata_rows_upserted,
     )
 
     return {
@@ -1298,6 +1464,7 @@ async def upload_text_files(
         "created_new_store": created_new_store,
         "files": file_summaries,
         "embeddings_created": len(created_embeddings),
+        "story_metadata_rows_upserted": metadata_rows_upserted,
         "created": int(time.time()),
     }
 
@@ -1347,6 +1514,7 @@ async def upload_text_files_stream(
 
             embedding_requests: list[EmbeddingCreateRequest] = []
             file_summaries: list[dict[str, Any]] = []
+            extracted_story_metadata: dict[str, StoryMetadata] = {}
             embedding_batch_size = max(1, min(64, settings.embedding.concurrency * 8))
 
             processed_index = 0
@@ -1388,6 +1556,12 @@ async def upload_text_files_stream(
                     text = raw_bytes.decode("utf-8")
                 except UnicodeDecodeError:
                     text = raw_bytes.decode("utf-8-sig", errors="replace")
+
+                extracted_story_metadata[upload.filename] = await extract_story_metadata_for_upload(
+                    upload.filename,
+                    text,
+                    resolved_vector_store_name,
+                )
 
                 chunks = chunk_text(text, max_chars=chunk_size, overlap=chunk_overlap)
                 if not chunks:
@@ -1490,12 +1664,17 @@ async def upload_text_files_stream(
                 resolved_vector_store_id,
                 embedding_requests,
             )
+            metadata_rows_upserted = await upsert_story_metadata_rows(
+                resolved_vector_store_id,
+                extracted_story_metadata,
+            )
 
             result_payload = {
                 "vector_store_id": resolved_vector_store_id,
                 "created_new_store": created_new_store,
                 "files": file_summaries,
                 "embeddings_created": len(created_embeddings),
+                "story_metadata_rows_upserted": metadata_rows_upserted,
                 "created": int(time.time()),
             }
             record_activity(
@@ -1505,6 +1684,7 @@ async def upload_text_files_stream(
                 store_name=resolved_vector_store_name,
                 files_processed=len(file_summaries),
                 embeddings_created=len(created_embeddings),
+                story_metadata_rows_upserted=metadata_rows_upserted,
             )
             yield json.dumps({"type": "complete", "result": result_payload}) + "\n"
 

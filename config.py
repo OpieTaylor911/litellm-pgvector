@@ -1,6 +1,7 @@
 from typing import Dict, Optional
 from pydantic import BaseModel
 from pydantic_settings import BaseSettings
+from pydantic import ConfigDict
 
 
 class DatabaseFieldConfig(BaseModel):
@@ -20,9 +21,22 @@ class EmbeddingConfig(BaseModel):
     api_key: str = "sk-1234"  # LiteLLM proxy API key
     dimensions: int = 1536
     concurrency: int = 8
+    batch_size: int = 8
+    load_retry_attempts: int = 24
+    load_retry_delay_seconds: float = 5.0
+    load_retry_backoff: float = 1.25
+    load_retry_max_delay_seconds: float = 20.0
+    retry_on_loading_errors: bool = True
 
 
 class Settings(BaseSettings):
+    model_config = ConfigDict(
+        env_file=".env",
+        env_nested_delimiter="__",
+        case_sensitive=False,
+        extra="ignore",
+    )
+
     """Application settings"""
     # Database configuration
     database_url: str = "postgresql://username:password@localhost:5432/vectordb?schema=public"
@@ -34,6 +48,12 @@ class Settings(BaseSettings):
     backup_root_dir: str = "backup"
     port: int = 8000
     host: str = "0.0.0.0"
+    story_metadata_llm_model: str = "openai/qwen3.6-35b-a3b"
+    story_metadata_llm_api_base: Optional[str] = None
+    story_metadata_llm_api_key: Optional[str] = None
+    local_lm_studio_api_key: Optional[str] = None
+    local_lm_studio_url: Optional[str] = None
+    local_lm_studio_tailscale_url: Optional[str] = None
     
     # Database field mappings
     db_fields: DatabaseFieldConfig = DatabaseFieldConfig()
@@ -41,15 +61,10 @@ class Settings(BaseSettings):
     # Embedding configuration
     embedding: EmbeddingConfig = EmbeddingConfig()
     
-    class Config:
-        env_file = ".env"
-        env_nested_delimiter = "__"
-        case_sensitive = False
-        
-        # Allow environment variables like:
-        # DB_FIELDS__ID_FIELD=custom_id
-        # EMBEDDING__MODEL=text-embedding-3-small
-        # EMBEDDING__API_BASE=https://api.openai.com/v1
+    # Allow environment variables like:
+    # DB_FIELDS__ID_FIELD=custom_id
+    # EMBEDDING__MODEL=text-embedding-3-small
+    # EMBEDDING__API_BASE=https://api.openai.com/v1
         
     @property
     def table_names(self) -> Dict[str, str]:
