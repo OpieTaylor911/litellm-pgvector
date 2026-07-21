@@ -429,7 +429,7 @@
       <div class="upload-status" id="exposure-status" aria-live="polite">Loading…</div>
       <table class="exposure-table" id="exposure-table">
         <thead>
-          <tr><th>Exposed</th><th>Store</th><th>ID</th></tr>
+          <tr><th>Exposed</th><th>Store</th><th>ID</th><th>Ingest</th></tr>
         </thead>
         <tbody id="exposure-table-body"></tbody>
       </table>
@@ -601,7 +601,7 @@
 
     async function checkHealth() {
       try {
-        const response = await fetch('/health');
+        const response = await fetch('/v1/health');
         const payload = await readResponsePayload(response);
         if (!response.ok) {
           throw new Error(payload?.detail || `Health check failed (${response.status})`);
@@ -948,6 +948,43 @@
       if (kind !== 'idle') exposureStatus.classList.add(kind);
     }
 
+    async function triggerStoreIngest(store, button, statusEl) {
+      const oldText = button.textContent;
+      button.disabled = true;
+      button.textContent = 'Starting...';
+      statusEl.textContent = '';
+
+      try {
+        const response = await fetch(`/v1/vector_stores/${encodeURIComponent(store.id)}/ingest-background`, {
+          method: 'POST',
+          headers: authHeaders(),
+        });
+        const payload = await readResponsePayload(response);
+        if (!response.ok) {
+          throw new Error(payload?.detail || `Ingest launch failed (${response.status})`);
+        }
+
+        const started = !!payload?.started;
+        if (started) {
+          const jobId = payload?.job?.job_id || 'unknown';
+          statusEl.textContent = `Queued (${jobId.slice(0, 8)})`;
+          setExposureStatus(`Ingest queued for '${store.name}'.`, 'success');
+          button.textContent = 'Queued';
+        } else {
+          const reason = payload?.reason || payload?.job?.status || 'not-started';
+          statusEl.textContent = `Busy (${reason})`;
+          setExposureStatus(`Ingest not started for '${store.name}': ${reason}`, 'error');
+          button.textContent = 'Run ingest';
+        }
+      } catch (error) {
+        statusEl.textContent = 'Error';
+        setExposureStatus(`Error: ${error.message}`, 'error');
+        button.textContent = oldText;
+      } finally {
+        button.disabled = false;
+      }
+    }
+
     async function loadExposureTable() {
       setExposureStatus('Loading…', 'busy');
       try {
@@ -978,7 +1015,27 @@
           idCell.className = 'exposure-id';
           idCell.textContent = store.id;
 
-          row.append(toggleCell, nameCell, idCell);
+          const ingestCell = document.createElement('td');
+          const ingestWrap = document.createElement('div');
+          ingestWrap.style.display = 'grid';
+          ingestWrap.style.gap = '6px';
+
+          const ingestButton = document.createElement('button');
+          ingestButton.type = 'button';
+          ingestButton.className = 'ghost';
+          ingestButton.textContent = 'Run ingest';
+
+          const ingestState = document.createElement('span');
+          ingestState.style.fontSize = '0.8rem';
+          ingestState.style.color = 'var(--muted)';
+
+          ingestButton.addEventListener('click', () => triggerStoreIngest(store, ingestButton, ingestState));
+
+          ingestWrap.appendChild(ingestButton);
+          ingestWrap.appendChild(ingestState);
+          ingestCell.appendChild(ingestWrap);
+
+          row.append(toggleCell, nameCell, idCell, ingestCell);
           exposureTableBody.appendChild(row);
         }
 

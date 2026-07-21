@@ -11,7 +11,7 @@ from typing import Any, List, Optional
 from fastapi import FastAPI, HTTPException, Depends, File, Form, UploadFile
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials, HTTPBasic, HTTPBasicCredentials
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse, HTMLResponse
 from prisma import Prisma
 from dotenv import load_dotenv
 
@@ -64,6 +64,12 @@ app.add_middleware(
 db = Prisma()
 activity_events: deque[dict[str, Any]] = deque(maxlen=2000)
 activity_event_id = 0
+vector_store_ingest_jobs: dict[str, dict[str, Any]] = {}
+ingest_job_semaphore = asyncio.Semaphore(2)
+
+PROJECT_DIR = Path(__file__).parent
+INGEST_SCRIPT_PATH = PROJECT_DIR / "scripts" / "sync_new_fiction_stories.sh"
+INGEST_LOG_DIR = PROJECT_DIR / "logs" / "ingest-jobs"
 
 security = HTTPBearer()
 ui_security = HTTPBasic()
@@ -91,6 +97,80 @@ def record_activity(event_type: str, message: str, **data: Any) -> dict[str, Any
         event["data"] = data
     activity_events.append(event)
     return event
+
+
+def _new_ingest_job_id() -> str:
+    return secrets.token_hex(8)
+
+
+async def _run_ingest_job(job_id: str, vector_store_id: str, store_name: str) -> None:
+    job = vector_store_ingest_jobs[job_id]
+    await ingest_job_semaphore.acquire()
+    process = None
+    log_file = None
+    try:
+        job["status"] = "running"
+        job["started_at"] = int(time.time())
+
+        INGEST_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        log_path = INGEST_LOG_DIR / f"{job_id}.log"
+        log_file = open(log_path, "ab")
+        job["log_path"] = str(log_path)
+
+        env = os.environ.copy()
+        env["TOPIC_FILTER"] = store_name
+        # Manual UI-triggered ingest should avoid failing on model preload checks.
+        env["PRECHECK_EMBEDDING"] = env.get("PRECHECK_EMBEDDING", "0")
+
+        record_activity(
+            "ingest_started",
+            f"Background ingest started for {store_name}",
+            vector_store_id=vector_store_id,
+            store_name=store_name,
+            job_id=job_id,
+        )
+
+        process = await asyncio.create_subprocess_exec(
+            "bash",
+            str(INGEST_SCRIPT_PATH),
+            cwd=str(PROJECT_DIR),
+            env=env,
+            stdout=log_file,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        job["process_id"] = process.pid
+
+        return_code = await process.wait()
+        job["return_code"] = return_code
+        job["finished_at"] = int(time.time())
+        job["status"] = "completed" if return_code == 0 else "failed"
+
+        record_activity(
+            "ingest_finished",
+            f"Background ingest {job['status']} for {store_name}",
+            vector_store_id=vector_store_id,
+            store_name=store_name,
+            job_id=job_id,
+            return_code=return_code,
+        )
+    except Exception as exc:
+        job["status"] = "failed"
+        job["finished_at"] = int(time.time())
+        job["error"] = str(exc)
+        record_activity(
+            "ingest_failed",
+            f"Background ingest failed for {store_name}",
+            vector_store_id=vector_store_id,
+            store_name=store_name,
+            job_id=job_id,
+            error=str(exc),
+        )
+    finally:
+        if process and process.returncode is None:
+            process.kill()
+        if log_file is not None:
+            log_file.close()
+        ingest_job_semaphore.release()
 
 
 async def require_ui_login(credentials: HTTPBasicCredentials = Depends(ui_security)):
@@ -930,6 +1010,78 @@ async def list_story_files(
     ]
 
 
+@app.post("/v1/vector_stores/{vector_store_id}/ingest-background")
+async def launch_vector_store_ingest(
+    vector_store_id: str,
+    api_key: str = Depends(get_api_key),
+):
+    """Launch background ingest for one vector store topic."""
+    vector_store_table = settings.table_names["vector_stores"]
+    existing = await db.query_raw(
+        f"SELECT id, name FROM {vector_store_table} WHERE id = $1",
+        vector_store_id,
+    )
+    if not existing:
+        raise HTTPException(status_code=404, detail="Vector store not found")
+
+    store = existing[0]
+    store_name = store["name"]
+
+    for job in vector_store_ingest_jobs.values():
+        if (
+            job.get("vector_store_id") == vector_store_id
+            and job.get("status") in {"queued", "running"}
+        ):
+            return {
+                "started": False,
+                "reason": "active_job_exists",
+                "job": job,
+            }
+
+    if not INGEST_SCRIPT_PATH.is_file():
+        raise HTTPException(status_code=500, detail=f"Ingest script not found: {INGEST_SCRIPT_PATH}")
+
+    job_id = _new_ingest_job_id()
+    job = {
+        "job_id": job_id,
+        "vector_store_id": vector_store_id,
+        "store_name": store_name,
+        "topic": store_name,
+        "status": "queued",
+        "process_id": None,
+        "log_path": str(INGEST_LOG_DIR / f"{job_id}.log"),
+        "queued_at": int(time.time()),
+        "started_at": None,
+        "finished_at": None,
+        "return_code": None,
+    }
+    vector_store_ingest_jobs[job_id] = job
+
+    asyncio.create_task(_run_ingest_job(job_id, vector_store_id, store_name))
+
+    record_activity(
+        "ingest_queued",
+        f"Background ingest queued for {store_name}",
+        vector_store_id=vector_store_id,
+        store_name=store_name,
+        job_id=job_id,
+    )
+    return {"started": True, "job": job}
+
+
+@app.get("/v1/vector_stores/{vector_store_id}/ingest-background/{job_id}")
+async def get_vector_store_ingest_status(
+    vector_store_id: str,
+    job_id: str,
+    api_key: str = Depends(get_api_key),
+):
+    """Get status for a previously launched background ingest job."""
+    job = vector_store_ingest_jobs.get(job_id)
+    if not job or job.get("vector_store_id") != vector_store_id:
+        raise HTTPException(status_code=404, detail="Ingest job not found")
+    return job
+
+
 @app.get("/v1/vector_stores/{vector_store_id}/stories/{filename}/metadata", response_model=StoryMetadataResponse)
 async def get_story_metadata(
     vector_store_id: str,
@@ -1714,10 +1866,185 @@ async def upload_text_files_stream(
     )
 
 
-@app.get("/health")
-async def health_check():
-    """Health check endpoint"""
-    return {"status": "healthy", "timestamp": int(time.time())}
+async def _active_ingest_jobs_snapshot() -> list[dict[str, Any]]:
+        jobs = [
+                dict(job)
+                for job in vector_store_ingest_jobs.values()
+                if job.get("status") in {"queued", "running"}
+        ]
+
+        queued = [j for j in jobs if str(j.get("status")) == "queued"]
+        queued.sort(key=lambda j: int(j.get("queued_at") or 0))
+        queue_pos = {
+                str(j.get("job_id")): i + 1
+                for i, j in enumerate(queued)
+                if j.get("job_id")
+        }
+        queued_total = len(queued)
+        running_total = sum(1 for j in jobs if str(j.get("status")) == "running")
+
+        for job in jobs:
+                pos = queue_pos.get(str(job.get("job_id")))
+                job["queue_position"] = pos
+                job["queued_ahead"] = (pos - 1) if pos else 0
+                job["queued_total"] = queued_total
+                job["running_total"] = running_total
+
+        jobs.sort(key=lambda j: (int(j.get("queued_at") or 0), str(j.get("job_id") or "")))
+        return jobs
+
+
+@app.get("/health/activity")
+async def public_health_activity(limit: int = 25):
+        safe_limit = min(max(limit, 1), 500)
+        items = list(activity_events)[-safe_limit:]
+        return {"status": "healthy", "data": items, "count": len(items), "timestamp": int(time.time())}
+
+
+@app.get("/health/summary")
+async def public_health_summary():
+        vector_store_table = settings.table_names["vector_stores"]
+        stores = await db.query_raw(
+                f"SELECT id, name, file_counts, usage_bytes, status, metadata FROM {vector_store_table}"
+        )
+
+        total_stores = len(stores)
+        exposed_stores = sum(1 for s in stores if is_store_exposed(s.get("metadata")))
+        total_usage_bytes = sum(int(s.get("usage_bytes") or 0) for s in stores)
+        total_files = 0
+        for store in stores:
+                file_counts = store.get("file_counts") or {}
+                total_files += int(file_counts.get("total") or 0)
+
+        active_jobs = await _active_ingest_jobs_snapshot()
+        recent_activity = list(activity_events)[-25:]
+
+        return {
+                "status": "healthy",
+                "timestamp": int(time.time()),
+                "vector_store_totals": {
+                        "stores": total_stores,
+                        "exposed_stores": exposed_stores,
+                        "files": total_files,
+                        "usage_bytes": total_usage_bytes,
+                },
+                "active_ingest_jobs": active_jobs,
+                "recent_activity": recent_activity,
+        }
+
+
+@app.get("/v1/health")
+async def health_check_json():
+        """JSON health probe endpoint."""
+        return {"status": "healthy", "timestamp": int(time.time())}
+
+
+@app.get("/health", response_class=HTMLResponse)
+async def health_dashboard():
+        """Simple live health dashboard with ingest/job visibility."""
+        return """<!doctype html>
+<html lang=\"en\">
+<head>
+    <meta charset=\"utf-8\" />
+    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
+    <title>Service Health</title>
+    <style>
+        :root { --bg:#0c1224; --card:#131b36; --line:#2a365f; --text:#e8eeff; --muted:#9eb0e8; --ok:#33d6a6; }
+        body { margin:0; font-family: Georgia, \"Times New Roman\", serif; color:var(--text); background:linear-gradient(180deg,#0f1731,#0b1020); }
+        main { width:min(1080px, calc(100vw - 24px)); margin:16px auto; display:grid; gap:14px; }
+        .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:14px; }
+        h1 { margin:0; font-size:1.6rem; }
+        .sub { color:var(--muted); margin-top:6px; }
+        .stats { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; }
+        .pill { border:1px solid var(--line); border-radius:12px; padding:10px; background:rgba(255,255,255,0.02); }
+        .k { color:var(--muted); font-size:.85rem; }
+        .v { font-size:1.15rem; margin-top:4px; }
+        .job, .evt { border:1px solid var(--line); border-radius:10px; padding:10px; margin-top:8px; background:rgba(255,255,255,0.02); }
+        .row { display:flex; justify-content:space-between; gap:12px; flex-wrap:wrap; }
+        .ok { color:var(--ok); font-weight:700; }
+        code { color:#b8c8ff; }
+        @media (max-width: 800px) { .stats { grid-template-columns:repeat(2,minmax(0,1fr)); } }
+    </style>
+</head>
+<body>
+    <main>
+        <section class=\"card\">
+            <h1>Service Health</h1>
+            <div class=\"sub\">Live status for vector stores, active ingest jobs, and recent activity.</div>
+            <div class=\"sub\" id=\"stamp\">Loading...</div>
+        </section>
+
+        <section class=\"card\">
+            <div class=\"stats\">
+                <div class=\"pill\"><div class=\"k\">Stores</div><div class=\"v\" id=\"stores\">-</div></div>
+                <div class=\"pill\"><div class=\"k\">Exposed</div><div class=\"v\" id=\"exposed\">-</div></div>
+                <div class=\"pill\"><div class=\"k\">Files</div><div class=\"v\" id=\"files\">-</div></div>
+                <div class=\"pill\"><div class=\"k\">Usage bytes</div><div class=\"v\" id=\"usage\">-</div></div>
+            </div>
+        </section>
+
+        <section class=\"card\">
+            <h2>Active ingest jobs</h2>
+            <div id=\"jobs\"></div>
+        </section>
+
+        <section class=\"card\">
+            <h2>Recent activity</h2>
+            <div id=\"events\"></div>
+        </section>
+    </main>
+
+    <script>
+        const fmt = (ts) => new Date((ts || Math.floor(Date.now()/1000)) * 1000).toLocaleTimeString();
+        const jobsEl = document.getElementById('jobs');
+        const eventsEl = document.getElementById('events');
+
+        function renderJobs(jobs) {
+            jobsEl.innerHTML = '';
+            if (!jobs || !jobs.length) {
+                jobsEl.innerHTML = '<div class=\"sub\">No queued/running jobs.</div>';
+                return;
+            }
+            for (const j of jobs) {
+                const d = document.createElement('div');
+                d.className = 'job';
+                d.innerHTML = `<div class=\"row\"><strong>${j.store_name || j.topic || j.vector_store_id}</strong><span class=\"ok\">${j.status}</span></div>
+                    <div class=\"sub\">job <code>${j.job_id}</code> · queued ${fmt(j.queued_at)} · queue ${j.queue_position || '-'} / ${j.queued_total || 0}</div>`;
+                jobsEl.appendChild(d);
+            }
+        }
+
+        function renderEvents(events) {
+            eventsEl.innerHTML = '';
+            if (!events || !events.length) {
+                eventsEl.innerHTML = '<div class=\"sub\">No recent activity.</div>';
+                return;
+            }
+            for (const e of events) {
+                const d = document.createElement('div');
+                d.className = 'evt';
+                d.innerHTML = `<div class=\"row\"><strong>${e.type}</strong><span>${fmt(e.timestamp)}</span></div><div>${e.message}</div>`;
+                eventsEl.appendChild(d);
+            }
+        }
+
+        async function refresh() {
+            const res = await fetch('/health/summary');
+            const data = await res.json();
+            document.getElementById('stamp').textContent = `Updated ${fmt(data.timestamp)} · status ${data.status}`;
+            document.getElementById('stores').textContent = data.vector_store_totals?.stores ?? '-';
+            document.getElementById('exposed').textContent = data.vector_store_totals?.exposed_stores ?? '-';
+            document.getElementById('files').textContent = data.vector_store_totals?.files ?? '-';
+            document.getElementById('usage').textContent = data.vector_store_totals?.usage_bytes ?? '-';
+            renderJobs(data.active_ingest_jobs || []);
+            renderEvents(data.recent_activity || []);
+        }
+
+        refresh();
+        setInterval(refresh, 2000);
+    </script>
+</body>
+</html>"""
 
 
 if __name__ == "__main__":
