@@ -8,3 +8,5 @@ fiction/*
 mcp-server/.venv
 mcp-server/.env
 mcp-server/.mcp_bearer_token.txt
+logs/*
+config.py

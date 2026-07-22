@@ -29,6 +29,14 @@ print(urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(filtered_que
 PY
 }
 
+normalize_store_name() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  value=$(printf '%s' "$value" | tr -s '[:space:]' ' ')
+  printf '%s' "${value,,}"
+}
+
 list_vector_stores() {
   python3 - "$API_BASE" "$API_KEY" <<'PY'
 import json
@@ -270,7 +278,8 @@ NORMALIZED_DATABASE_URL=$(normalize_database_url "$DATABASE_URL")
 declare -A STORE_IDS=()
 while IFS=$'\t' read -r name id; do
   [[ -n "$name" && -n "$id" ]] || continue
-  STORE_IDS["$name"]="$id"
+  normalized_name=$(normalize_store_name "$name")
+  STORE_IDS["$normalized_name"]="$id"
 done < <(list_vector_stores)
 
 topic_count=0
@@ -295,11 +304,13 @@ for topic_dir in "$FIC_ROOT"/*; do
     continue
   fi
 
-  if [[ -n "${STORE_IDS[$topic]+x}" ]]; then
-    vector_store_id="${STORE_IDS[$topic]}"
+  topic_key=$(normalize_store_name "$topic")
+
+  if [[ -n "${STORE_IDS[$topic_key]+x}" ]]; then
+    vector_store_id="${STORE_IDS[$topic_key]}"
   else
     vector_store_id=$(create_vector_store "$topic")
-    STORE_IDS["$topic"]="$vector_store_id"
+    STORE_IDS["$topic_key"]="$vector_store_id"
     echo "[$topic] created vector store: $vector_store_id"
   fi
 

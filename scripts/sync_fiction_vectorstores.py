@@ -142,6 +142,10 @@ def choose_preferred_store(matches: list[dict[str, Any]]) -> dict[str, Any]:
     return max(matches, key=sort_key)
 
 
+def normalize_store_name(name: str) -> str:
+    return " ".join((name or "").split()).lower()
+
+
 def create_vector_store(api_base: str, api_key: str, topic: str) -> dict[str, Any]:
     url = f"{api_base.rstrip('/')}/v1/vector_stores"
     return api_request(
@@ -355,7 +359,7 @@ def main() -> int:
 
     stores_by_name: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for store in stores:
-        stores_by_name[store["name"]].append(store)
+        stores_by_name[normalize_store_name(store["name"])].append(store)
 
     topic_to_store_id: dict[str, str] = {}
     failed_uploads: list[dict[str, str]] = []
@@ -369,7 +373,8 @@ def main() -> int:
             print("No .txt files found, skipping due to --skip-empty.\n")
             continue
 
-        matches = stores_by_name.get(topic, [])
+        topic_key = normalize_store_name(topic)
+        matches = stores_by_name.get(topic_key, [])
         if len(matches) > 1:
             match_ids = ", ".join(store["id"] for store in matches)
             print(f"WARNING: multiple vector stores named '{topic}': {match_ids}")

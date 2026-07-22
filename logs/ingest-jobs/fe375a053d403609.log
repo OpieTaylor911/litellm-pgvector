@@ -1,1 +1,8 @@
 [gay-bdsm] uploading 1432 new file(s) to 6278d066-2c1b-485e-903a-e59436539369
+upload batch failed (attempt 1/3); status=502
+{"detail":"Failed to generate embeddings via LiteLLM proxy. Check EMBEDDING__BASE_URL and EMBEDDING__API_KEY settings. Details: Failed to generate embeddings: Failed to generate embeddings: HTTP 400: {\"error\":{\"message\":\"litellm.BadRequestError: OpenAIException - Error code: 400 - {'error': 'Model was unloaded while the request was still in queue..'}No fallback model group found for original 
+upload batch failed (attempt 2/3); status=500
+Internal Server Error
+upload batch failed (attempt 3/3); status=500
+Internal Server Error
+ERROR: failed to upload batch starting at file index 0

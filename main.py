@@ -240,6 +240,64 @@ def is_store_exposed(metadata: Optional[dict[str, Any]]) -> bool:
     return bool(metadata.get("api_exposed", False))
 
 
+def _search_content_keywords_sql(query: str, limit: int, target_ids: list[str]) -> tuple[str, list[Any]]:
+    words = [word.lower() for word in re.findall(r"[a-z0-9]+", query.lower()) if len(word) >= 3]
+    if not words:
+        words = [query.lower().strip()]
+
+    pattern = "|".join(re.escape(word) for word in words if word)
+    if not pattern:
+        pattern = re.escape(query.lower().strip())
+
+    escaped_target_ids = ", ".join("'" + target_id.replace("'", "''") + "'" for target_id in target_ids)
+    if not escaped_target_ids:
+        escaped_target_ids = "''"
+
+    vector_store_table = settings.table_names["vector_stores"]
+    fields = settings.db_fields
+    table_name = settings.table_names["embeddings"]
+    sql = f"""
+        SELECT
+            e.{fields.id_field} as id,
+            e.{fields.vector_store_id_field} as vector_store_id,
+            e.{fields.content_field} as content,
+            e.{fields.metadata_field} as metadata,
+            0.0 as score,
+            s.name as vector_store_name,
+            sm.id as sm_id,
+            sm.genres, sm.romance_subgenres, sm.tropes, sm.relationship_types,
+            sm.character_archetypes, sm.occupations, sm.settings, sm.sports,
+            sm.military, sm.kinks, sm.emotional_tone, sm.major_conflicts,
+            sm.coming_out, sm.first_love, sm.forbidden_romance, sm.found_family,
+            sm.slow_burn, sm.enemies_to_lovers, sm.hurt_comfort, sm.age_gap,
+            sm.college, sm.military_romance, sm.heat_level, sm.content_warnings,
+            sm.search_keywords, sm.pov, sm.tone, sm.explicitness,
+            sm.relationship_structure, sm.ending
+        FROM {table_name} e
+        JOIN {vector_store_table} s ON s.id = e.{fields.vector_store_id_field}
+        LEFT JOIN {STORY_METADATA_TABLE} sm
+            ON sm.vector_store_id = e.{fields.vector_store_id_field}
+           AND sm.filename = e.{fields.metadata_field}->>'filename'
+        WHERE e.{fields.vector_store_id_field} IN ({escaped_target_ids})
+          AND (
+                e.{fields.content_field} ILIKE $1
+             OR e.{fields.metadata_field}::text ILIKE $1
+             OR sm.search_keywords::text ILIKE $1
+          )
+        ORDER BY s.name ASC, e.{fields.id_field} ASC
+        LIMIT $2
+    """
+    return sql, [f"%{pattern}%", limit]
+
+
+async def _safe_query_embedding(query: str) -> Optional[list[float]]:
+    try:
+        timeout_seconds = max(0.5, float(settings.embedding.query_timeout_seconds))
+        return await asyncio.wait_for(generate_query_embedding(query), timeout=timeout_seconds)
+    except Exception:
+        return None
+
+
 # ── Structured story metadata (genres, tropes, kinks, heat level, etc.) ─────
 STORY_METADATA_TABLE = "story_metadata"
 
@@ -597,20 +655,116 @@ def chunk_text(text: str, max_chars: int = 1600, overlap: int = 200) -> list[str
     return chunks
 
 
+def canonicalize_vector_store_name(name: str) -> str:
+    """Collapse whitespace and trim so equivalent names map consistently."""
+    return " ".join((name or "").split())
+
+
+def normalize_vector_store_name(name: str) -> str:
+    return canonicalize_vector_store_name(name).lower()
+
+
 async def create_vector_store_record(
     name: str,
     expires_after: Optional[dict[str, Any]] = None,
     metadata: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
+    canonical_name = canonicalize_vector_store_name(name)
+    if not canonical_name:
+        raise HTTPException(status_code=400, detail="Vector store name is required")
+
+    normalized_name = normalize_vector_store_name(canonical_name)
     vector_store_table = settings.table_names["vector_stores"]
     result = await db.query_raw(
         f"""
-        INSERT INTO {vector_store_table} (id, name, file_counts, status, usage_bytes, expires_after, metadata, created_at)
-        VALUES (gen_random_uuid()::text, $1, $2, $3, $4, $5, $6, NOW())
-        RETURNING id, name, file_counts, status, usage_bytes, expires_after, expires_at, last_active_at, metadata,
-                 EXTRACT(EPOCH FROM created_at)::bigint as created_at_timestamp
+        WITH lock_row AS (
+            SELECT pg_advisory_lock(hashtext($1))
+        ),
+        existing AS (
+            SELECT
+                id,
+                name,
+                file_counts,
+                status,
+                usage_bytes,
+                expires_after,
+                expires_at,
+                last_active_at,
+                metadata,
+                created_at
+            FROM {vector_store_table}
+            WHERE lower(regexp_replace(btrim(name), '\\s+', ' ', 'g')) = $1
+            ORDER BY created_at ASC
+            LIMIT 1
+        ),
+        inserted AS (
+            INSERT INTO {vector_store_table} (id, name, file_counts, status, usage_bytes, expires_after, metadata, created_at)
+            SELECT gen_random_uuid()::text, $2, $3, $4, $5, $6, $7, NOW()
+            FROM lock_row
+            WHERE NOT EXISTS (SELECT 1 FROM existing)
+            RETURNING
+                id,
+                name,
+                file_counts,
+                status,
+                usage_bytes,
+                expires_after,
+                expires_at,
+                last_active_at,
+                metadata,
+                created_at
+        ),
+        chosen AS (
+            SELECT
+                id,
+                name,
+                file_counts,
+                status,
+                usage_bytes,
+                expires_after,
+                expires_at,
+                last_active_at,
+                metadata,
+                created_at,
+                FALSE AS created_new
+            FROM existing
+            UNION ALL
+            SELECT
+                id,
+                name,
+                file_counts,
+                status,
+                usage_bytes,
+                expires_after,
+                expires_at,
+                last_active_at,
+                metadata,
+                created_at,
+                TRUE AS created_new
+            FROM inserted
+        ),
+        unlock_row AS (
+            SELECT pg_advisory_unlock(hashtext($1))
+            FROM lock_row
+        )
+        SELECT
+            chosen.id,
+            chosen.name,
+            chosen.file_counts,
+            chosen.status,
+            chosen.usage_bytes,
+            chosen.expires_after,
+            chosen.expires_at,
+            chosen.last_active_at,
+            chosen.metadata,
+            chosen.created_new,
+            EXTRACT(EPOCH FROM chosen.created_at)::bigint as created_at_timestamp
+        FROM chosen
+        CROSS JOIN unlock_row
+        LIMIT 1
         """,
-        name,
+        normalized_name,
+        canonical_name,
         {"in_progress": 0, "completed": 0, "failed": 0, "cancelled": 0, "total": 0},
         "completed",
         0,
@@ -636,7 +790,7 @@ async def get_vector_store_id_or_create(
             raise HTTPException(status_code=404, detail="Vector store not found")
         return str(vector_store_id), result[0]["name"], False
 
-    cleaned_name = (vector_store_name or "").strip()
+    cleaned_name = canonicalize_vector_store_name(vector_store_name or "")
     if not cleaned_name:
         raise HTTPException(
             status_code=400,
@@ -647,7 +801,7 @@ async def get_vector_store_id_or_create(
         cleaned_name,
         metadata={"created_via": "upload_ui"},
     )
-    return str(vector_store["id"]), vector_store["name"], True
+    return str(vector_store["id"]), vector_store["name"], bool(vector_store.get("created_new", False))
 
 
 def _sanitize_path_segment(value: str) -> str:
@@ -1193,52 +1347,77 @@ async def search_scenes(
         if not target_ids:
             return SceneSearchResponse(search_query=request.query, data=[], has_more=False)
 
-        query_embedding = await generate_query_embedding(request.query)
-        query_vector_str = "[" + ",".join(map(str, query_embedding)) + "]"
-
         limit = min(request.limit or 10, 100)
         fields = settings.db_fields
         table_name = settings.table_names["embeddings"]
 
-        query_params: list[Any] = [query_vector_str, target_ids]
-        next_index = 3
-        extra_where = ""
-        if request.tag_filters:
-            tag_clause, tag_params, next_index = build_tag_filter_sql(request.tag_filters, next_index)
-            if tag_clause:
-                extra_where = f" AND {tag_clause}"
-            query_params.extend(tag_params)
+        keyword_sql, keyword_params = _search_content_keywords_sql(request.query, limit, target_ids)
+        keyword_results = await db.query_raw(keyword_sql, *keyword_params)
+        if keyword_results:
+            search_results = []
+            for row in keyword_results:
+                metadata = row["metadata"] or {}
+                filename = metadata.get("filename", "document.txt")
+                store_id = row["vector_store_id"]
+                search_results.append(
+                    SceneSearchResult(
+                        vector_store_id=store_id,
+                        vector_store_name=exposed_ids_by_id.get(store_id, "unknown"),
+                        file_id=row["id"],
+                        filename=filename,
+                        score=0.0,
+                        attributes=metadata if request.return_metadata else None,
+                        content=[ContentChunk(type="text", text=row["content"])],
+                        story_metadata=story_metadata_from_row(row) if row.get("sm_id") else None,
+                    )
+                )
+            return SceneSearchResponse(search_query=request.query, data=search_results, has_more=False)
 
-        limit_index = next_index
-        query_params.append(limit)
+        query_embedding = await _safe_query_embedding(request.query)
+        if query_embedding is not None:
+            query_vector_str = "[" + ",".join(map(str, query_embedding)) + "]"
 
-        results = await db.query_raw(
-            f"""
-            SELECT
-                e.{fields.id_field} as id,
-                e.{fields.vector_store_id_field} as vector_store_id,
-                e.{fields.content_field} as content,
-                e.{fields.metadata_field} as metadata,
-                (e.{fields.embedding_field} <=> $1::halfvec) as distance,
-                sm.id as sm_id,
-                sm.genres, sm.romance_subgenres, sm.tropes, sm.relationship_types,
-                sm.character_archetypes, sm.occupations, sm.settings, sm.sports,
-                sm.military, sm.kinks, sm.emotional_tone, sm.major_conflicts,
-                sm.coming_out, sm.first_love, sm.forbidden_romance, sm.found_family,
-                sm.slow_burn, sm.enemies_to_lovers, sm.hurt_comfort, sm.age_gap,
-                sm.college, sm.military_romance, sm.heat_level, sm.content_warnings,
-                sm.search_keywords, sm.pov, sm.tone, sm.explicitness,
-                sm.relationship_structure, sm.ending
-            FROM {table_name} e
-            LEFT JOIN {STORY_METADATA_TABLE} sm
-                ON sm.vector_store_id = e.{fields.vector_store_id_field}
-               AND sm.filename = e.{fields.metadata_field}->>'filename'
-            WHERE e.{fields.vector_store_id_field} = ANY($2::text[]){extra_where}
-            ORDER BY distance ASC
-            LIMIT ${limit_index}
-            """,
-            *query_params,
-        )
+            query_params: list[Any] = [query_vector_str, target_ids]
+            next_index = 3
+            extra_where = ""
+            if request.tag_filters:
+                tag_clause, tag_params, next_index = build_tag_filter_sql(request.tag_filters, next_index)
+                if tag_clause:
+                    extra_where = f" AND {tag_clause}"
+                query_params.extend(tag_params)
+
+            limit_index = next_index
+            query_params.append(limit)
+
+            results = await db.query_raw(
+                f"""
+                SELECT
+                    e.{fields.id_field} as id,
+                    e.{fields.vector_store_id_field} as vector_store_id,
+                    e.{fields.content_field} as content,
+                    e.{fields.metadata_field} as metadata,
+                    (e.{fields.embedding_field} <=> $1::halfvec) as distance,
+                    sm.id as sm_id,
+                    sm.genres, sm.romance_subgenres, sm.tropes, sm.relationship_types,
+                    sm.character_archetypes, sm.occupations, sm.settings, sm.sports,
+                    sm.military, sm.kinks, sm.emotional_tone, sm.major_conflicts,
+                    sm.coming_out, sm.first_love, sm.forbidden_romance, sm.found_family,
+                    sm.slow_burn, sm.enemies_to_lovers, sm.hurt_comfort, sm.age_gap,
+                    sm.college, sm.military_romance, sm.heat_level, sm.content_warnings,
+                    sm.search_keywords, sm.pov, sm.tone, sm.explicitness,
+                    sm.relationship_structure, sm.ending
+                FROM {table_name} e
+                LEFT JOIN {STORY_METADATA_TABLE} sm
+                    ON sm.vector_store_id = e.{fields.vector_store_id_field}
+                   AND sm.filename = e.{fields.metadata_field}->>'filename'
+                WHERE e.{fields.vector_store_id_field} = ANY($2::text[]){extra_where}
+                ORDER BY distance ASC
+                LIMIT ${limit_index}
+                """,
+                *query_params,
+            )
+        else:
+            results = []
 
         search_results = []
         for row in results:
@@ -1290,12 +1469,47 @@ async def search_vector_store(
         if not vector_store_result:
             raise HTTPException(status_code=404, detail="Vector store not found")
         
-        # Generate embedding for query
-        query_embedding = await generate_query_embedding(request.query)
-        query_vector_str = "[" + ",".join(map(str, query_embedding)) + "]"
-        
-        # Build the raw SQL query for vector similarity search
         limit = min(request.limit or 20, 100)  # Cap at 100 results
+
+        # Fast keyword fallback first. This keeps search usable even when
+        # the embedding backend is temporarily unavailable.
+        keyword_sql, keyword_params = _search_content_keywords_sql(request.query, limit, [vector_store_id])
+        keyword_results = await db.query_raw(keyword_sql, *keyword_params)
+        if keyword_results:
+            search_results = []
+            for row in keyword_results:
+                metadata = row["metadata"] or {}
+                filename = metadata.get("filename", "document.txt")
+                search_results.append(
+                    SearchResult(
+                        file_id=row["id"],
+                        filename=filename,
+                        score=0.0,
+                        attributes=metadata if request.return_metadata else None,
+                        content=[ContentChunk(type="text", text=row["content"])],
+                    )
+                )
+
+            return VectorStoreSearchResponse(
+                search_query=request.query,
+                data=search_results,
+                has_more=False,
+                next_page=None,
+            )
+
+        # Fall back to vector similarity search only when we can generate an embedding.
+        query_embedding = await _safe_query_embedding(request.query)
+        if query_embedding is None:
+            return VectorStoreSearchResponse(
+                search_query=request.query,
+                data=[],
+                has_more=False,
+                next_page=None,
+            )
+
+        query_vector_str = "[" + ",".join(map(str, query_embedding)) + "]"
+
+        # Build the raw SQL query for vector similarity search
         
         # Base query with vector similarity using cosine distance
         # Use configurable field names

@@ -17,8 +17,8 @@ class DatabaseFieldConfig(BaseModel):
 class EmbeddingConfig(BaseModel):
     """Configuration for embedding generation via LiteLLM proxy"""
     model: str = "text-embedding-ada-002"
-    base_url: str = "http://localhost:4000"  # LiteLLM proxy URL
-    api_key: str = "sk-1234"  # LiteLLM proxy API key
+    base_url: str = "http://100.68.118.88:4000"  # LiteLLM proxy URL
+    api_key: str = "sk-1lhkXs_1iN2T7ilbFPoDGA"  # LiteLLM proxy API key
     dimensions: int = 1536
     concurrency: int = 8
     batch_size: int = 8
@@ -27,6 +27,7 @@ class EmbeddingConfig(BaseModel):
     load_retry_backoff: float = 1.25
     load_retry_max_delay_seconds: float = 20.0
     retry_on_loading_errors: bool = True
+    query_timeout_seconds: float = 4.0
 
 
 class Settings(BaseSettings):
