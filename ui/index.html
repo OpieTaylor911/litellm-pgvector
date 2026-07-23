@@ -434,6 +434,15 @@
         <tbody id="exposure-table-body"></tbody>
       </table>
     </section>
+
+    <section class="card grid" style="margin-top:24px;">
+      <h2>Ingest Tracker</h2>
+      <div class="actions" style="align-items:end;">
+        <button type="button" class="ghost" id="refresh-ingest-status">Refresh ingest status</button>
+      </div>
+      <div class="upload-status" id="ingest-status-summary" aria-live="polite">Loading…</div>
+      <pre id="ingest-status-log">Loading ingest status…</pre>
+    </section>
   </main>
 
   <script>
@@ -451,6 +460,9 @@
     const uploadButton = document.getElementById('upload-button');
     const refreshStoresButton = document.getElementById('refresh-stores');
     const uploadStatus = document.getElementById('upload-status');
+    const refreshIngestStatusButton = document.getElementById('refresh-ingest-status');
+    const ingestStatusSummary = document.getElementById('ingest-status-summary');
+    const ingestStatusLog = document.getElementById('ingest-status-log');
 
     let selectedFiles = [];
     let uploadTicker = null;
@@ -611,6 +623,47 @@
       } catch (error) {
         healthDot.classList.remove('live');
         healthText.textContent = error.message;
+      }
+    }
+
+    function setIngestTrackerStatus(message, kind = 'idle') {
+      ingestStatusSummary.textContent = message;
+      ingestStatusSummary.classList.remove('busy', 'error', 'success');
+      if (kind !== 'idle') ingestStatusSummary.classList.add(kind);
+    }
+
+    function formatTrackerLine(item) {
+      const when = new Date((item.created_at_ts || Math.floor(Date.now() / 1000)) * 1000).toLocaleString();
+      const filePath = item.folder ? `${item.folder}/${item.filename}` : item.filename;
+      const errorText = item.error ? ` | error=${item.error}` : '';
+      return `[${when}] ${item.status}/${item.stage} :: ${filePath}${errorText}`;
+    }
+
+    async function loadIngestStatus() {
+      setIngestTrackerStatus('Loading ingest status…', 'busy');
+      try {
+        const response = await fetch('/v1/ingest/status?incomplete_only=true&limit=200', {
+          headers: authHeaders(),
+        });
+        const payload = await readResponsePayload(response);
+        if (!response.ok) {
+          throw new Error(payload?.detail || `Failed to load ingest status (${response.status})`);
+        }
+
+        const rows = payload.data || [];
+        if (!rows.length) {
+          ingestStatusLog.textContent = 'No incomplete files currently tracked.';
+        } else {
+          ingestStatusLog.textContent = rows.map(formatTrackerLine).join('\n');
+        }
+
+        const summary = payload.summary || {};
+        const parts = Object.keys(summary).sort().map((key) => `${key}:${summary[key]}`);
+        const summaryText = parts.length ? parts.join(' | ') : 'No status summary available';
+        setIngestTrackerStatus(`Incomplete files: ${rows.length}. Latest status counts: ${summaryText}`, 'success');
+      } catch (error) {
+        ingestStatusLog.textContent = `Error loading ingest status: ${error.message}`;
+        setIngestTrackerStatus(`Error: ${error.message}`, 'error');
       }
     }
 
@@ -835,6 +888,7 @@
 
     fileInput.addEventListener('change', (event) => setFiles(event.target.files));
     refreshStoresButton.addEventListener('click', refreshStores);
+    refreshIngestStatusButton.addEventListener('click', loadIngestStatus);
     uploadButton.addEventListener('click', uploadFiles);
 
     ['dragenter', 'dragover'].forEach((eventName) => {
@@ -856,6 +910,8 @@
     checkHealth();
     refreshStores();
     startActivityTail();
+    loadIngestStatus();
+    setInterval(loadIngestStatus, 15000);
 
     // ── Query section ──────────────────────────────────────────────────────────
     const queryStoreSelect = document.getElementById('query-store-select');

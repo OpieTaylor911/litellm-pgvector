@@ -150,7 +150,12 @@ fetch_existing_story_filenames() {
   local vector_store_id="$2"
 
   PGPASSWORD=${PGPASSWORD:-} psql -At -d "$normalized_database_url" -v ON_ERROR_STOP=1 -c \
-    "SELECT filename FROM story_metadata WHERE vector_store_id = '${vector_store_id}' ORDER BY filename;"
+    "SELECT DISTINCT filename
+     FROM ingest_file_stages
+     WHERE vector_store_id = '${vector_store_id}'
+       AND stage = 'completed'
+       AND status = 'completed'
+     ORDER BY filename;"
 }
 
 upload_new_files() {
@@ -238,6 +243,7 @@ CHUNK_OVERLAP=${CHUNK_OVERLAP:-200}
 SKIP_EMPTY=${SKIP_EMPTY:-1}
 TOPIC_FILTER=${TOPIC_FILTER:-}
 MAX_FILES_PER_REQUEST=${MAX_FILES_PER_REQUEST:-20}
+MAX_NEW_FILES_PER_TOPIC=${MAX_NEW_FILES_PER_TOPIC:-20}
 UPLOAD_RETRIES=${UPLOAD_RETRIES:-3}
 UPLOAD_MAX_TIME_SECONDS=${UPLOAD_MAX_TIME_SECONDS:-1800}
 PRECHECK_EMBEDDING=${PRECHECK_EMBEDDING:-1}
@@ -266,6 +272,11 @@ if [[ "$CHUNK_OVERLAP" -ge "$CHUNK_SIZE" ]]; then
   exit 1
 fi
 
+if ! [[ "$MAX_NEW_FILES_PER_TOPIC" =~ ^[0-9]+$ ]] || [[ "$MAX_NEW_FILES_PER_TOPIC" -lt 1 ]]; then
+  echo "ERROR: MAX_NEW_FILES_PER_TOPIC must be a positive integer" >&2
+  exit 1
+fi
+
 if [[ "$PRECHECK_EMBEDDING" == "1" ]]; then
   if [[ -z "$EMBED_MODEL" || -z "$EMBED_BASE_URL" || -z "$EMBED_API_KEY" ]]; then
     echo "WARN: skipping embedding preflight (EMBEDDING__MODEL/BASE_URL/API_KEY not fully set)" >&2
@@ -285,6 +296,7 @@ done < <(list_vector_stores)
 topic_count=0
 uploaded_count=0
 skipped_count=0
+pending_count=0
 
 for topic_dir in "$FIC_ROOT"/*; do
   [[ -d "$topic_dir/source" ]] || continue
@@ -334,9 +346,18 @@ for topic_dir in "$FIC_ROOT"/*; do
     continue
   fi
 
-  echo "[$topic] uploading ${#new_files[@]} new file(s) to $vector_store_id"
-  upload_new_files "$vector_store_id" "${new_files[@]}"
-  uploaded_count=$((uploaded_count + ${#new_files[@]}))
+  selected_files=("${new_files[@]}")
+  topic_pending=0
+  if [[ ${#new_files[@]} -gt $MAX_NEW_FILES_PER_TOPIC ]]; then
+    selected_files=("${new_files[@]:0:$MAX_NEW_FILES_PER_TOPIC}")
+    topic_pending=$(( ${#new_files[@]} - ${#selected_files[@]} ))
+    pending_count=$((pending_count + topic_pending))
+    echo "[$topic] limiting upload to ${#selected_files[@]} file(s); ${topic_pending} remaining for next run"
+  fi
+
+  echo "[$topic] uploading ${#selected_files[@]} new file(s) to $vector_store_id"
+  upload_new_files "$vector_store_id" "${selected_files[@]}"
+  uploaded_count=$((uploaded_count + ${#selected_files[@]}))
 done
 
-echo "done: topics=$topic_count uploaded_files=$uploaded_count skipped_topics=$skipped_count"
+echo "done: topics=$topic_count uploaded_files=$uploaded_count skipped_topics=$skipped_count pending_files=$pending_count"

@@ -70,6 +70,9 @@ ingest_job_semaphore = asyncio.Semaphore(2)
 PROJECT_DIR = Path(__file__).parent
 INGEST_SCRIPT_PATH = PROJECT_DIR / "scripts" / "sync_new_fiction_stories.sh"
 INGEST_LOG_DIR = PROJECT_DIR / "logs" / "ingest-jobs"
+STORY_METADATA_MAX_CHARS = max(2000, int(os.getenv("STORY_METADATA_MAX_CHARS", "20000")))
+INGEST_WATCHDOG_RETRIES = max(0, int(os.getenv("INGEST_WATCHDOG_RETRIES", "3")))
+INGEST_WATCHDOG_RETRY_DELAY_SECONDS = max(1, int(os.getenv("INGEST_WATCHDOG_RETRY_DELAY_SECONDS", "15")))
 
 security = HTTPBearer()
 ui_security = HTTPBasic()
@@ -119,40 +122,74 @@ async def _run_ingest_job(job_id: str, vector_store_id: str, store_name: str) ->
 
         env = os.environ.copy()
         env["TOPIC_FILTER"] = store_name
+        env["MAX_NEW_FILES_PER_TOPIC"] = env.get("MAX_NEW_FILES_PER_TOPIC", "20")
         # Manual UI-triggered ingest should avoid failing on model preload checks.
         env["PRECHECK_EMBEDDING"] = env.get("PRECHECK_EMBEDDING", "0")
+        max_attempts = INGEST_WATCHDOG_RETRIES + 1
+        for attempt in range(1, max_attempts + 1):
+            job["attempt"] = attempt
+            record_activity(
+                "ingest_started",
+                f"Background ingest started for {store_name} (attempt {attempt}/{max_attempts})",
+                vector_store_id=vector_store_id,
+                store_name=store_name,
+                job_id=job_id,
+                attempt=attempt,
+                max_attempts=max_attempts,
+            )
 
-        record_activity(
-            "ingest_started",
-            f"Background ingest started for {store_name}",
-            vector_store_id=vector_store_id,
-            store_name=store_name,
-            job_id=job_id,
-        )
+            process = await asyncio.create_subprocess_exec(
+                "bash",
+                str(INGEST_SCRIPT_PATH),
+                cwd=str(PROJECT_DIR),
+                env=env,
+                stdout=log_file,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            job["process_id"] = process.pid
 
-        process = await asyncio.create_subprocess_exec(
-            "bash",
-            str(INGEST_SCRIPT_PATH),
-            cwd=str(PROJECT_DIR),
-            env=env,
-            stdout=log_file,
-            stderr=asyncio.subprocess.STDOUT,
-        )
-        job["process_id"] = process.pid
+            return_code = await process.wait()
+            job["return_code"] = return_code
+            process = None
 
-        return_code = await process.wait()
-        job["return_code"] = return_code
-        job["finished_at"] = int(time.time())
-        job["status"] = "completed" if return_code == 0 else "failed"
+            if return_code == 0:
+                job["finished_at"] = int(time.time())
+                job["status"] = "completed"
+                record_activity(
+                    "ingest_finished",
+                    f"Background ingest completed for {store_name}",
+                    vector_store_id=vector_store_id,
+                    store_name=store_name,
+                    job_id=job_id,
+                    attempt=attempt,
+                    return_code=return_code,
+                )
+                break
 
-        record_activity(
-            "ingest_finished",
-            f"Background ingest {job['status']} for {store_name}",
-            vector_store_id=vector_store_id,
-            store_name=store_name,
-            job_id=job_id,
-            return_code=return_code,
-        )
+            if attempt < max_attempts:
+                record_activity(
+                    "ingest_retry_scheduled",
+                    f"Background ingest failed for {store_name}; retrying in {INGEST_WATCHDOG_RETRY_DELAY_SECONDS}s",
+                    vector_store_id=vector_store_id,
+                    store_name=store_name,
+                    job_id=job_id,
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                    return_code=return_code,
+                )
+                await asyncio.sleep(INGEST_WATCHDOG_RETRY_DELAY_SECONDS)
+            else:
+                job["finished_at"] = int(time.time())
+                job["status"] = "failed"
+                record_activity(
+                    "ingest_finished",
+                    f"Background ingest failed for {store_name}",
+                    vector_store_id=vector_store_id,
+                    store_name=store_name,
+                    job_id=job_id,
+                    attempt=attempt,
+                    return_code=return_code,
+                )
     except Exception as exc:
         job["status"] = "failed"
         job["finished_at"] = int(time.time())
@@ -191,6 +228,7 @@ async def startup():
     """Connect to database on startup"""
     await db.connect()
     await ensure_story_metadata_table()
+    await ensure_ingest_file_stage_table()
     record_activity("system", "Server started")
 
 
@@ -212,6 +250,106 @@ async def list_activity(
     data = items[:safe_limit]
     last_id = data[-1]["id"] if data else after_id
     return {"object": "list", "data": data, "last_id": last_id}
+
+
+@app.get("/v1/ingest/status")
+async def list_ingest_status(
+    vector_store_id: Optional[str] = None,
+    status: Optional[str] = None,
+    incomplete_only: bool = True,
+    limit: int = 200,
+    api_key: str = Depends(get_api_key),
+):
+    """Return latest tracked ingest stage per file, newest first."""
+    safe_limit = min(max(limit, 1), 1000)
+    where_clauses: list[str] = ["rn = 1"]
+    params: list[Any] = []
+    idx = 1
+
+    if vector_store_id:
+        where_clauses.append(f"vector_store_id = ${idx}")
+        params.append(vector_store_id)
+        idx += 1
+
+    if status:
+        where_clauses.append(f"status = ${idx}")
+        params.append(status)
+        idx += 1
+
+    if incomplete_only:
+        where_clauses.append("NOT (stage = 'completed' AND status = 'completed')")
+
+    where_sql = " AND ".join(where_clauses)
+
+    rows = await db.query_raw(
+        f"""
+        WITH latest AS (
+            SELECT
+                id,
+                vector_store_id,
+                folder,
+                filename,
+                stage,
+                status,
+                detail,
+                error,
+                created_at,
+                EXTRACT(EPOCH FROM created_at)::bigint AS created_at_ts,
+                ROW_NUMBER() OVER (
+                    PARTITION BY vector_store_id, folder, filename
+                    ORDER BY created_at DESC, id DESC
+                ) AS rn
+            FROM {INGEST_FILE_STAGE_TABLE}
+        )
+        SELECT
+            id,
+            vector_store_id,
+            folder,
+            filename,
+            stage,
+            status,
+            detail,
+            error,
+            created_at_ts
+        FROM latest
+        WHERE {where_sql}
+        ORDER BY created_at DESC, id DESC
+        LIMIT {safe_limit}
+        """,
+        *params,
+    )
+
+    summary_rows = await db.query_raw(
+        f"""
+        WITH latest AS (
+            SELECT
+                vector_store_id,
+                folder,
+                filename,
+                stage,
+                status,
+                ROW_NUMBER() OVER (
+                    PARTITION BY vector_store_id, folder, filename
+                    ORDER BY created_at DESC, id DESC
+                ) AS rn
+            FROM {INGEST_FILE_STAGE_TABLE}
+        )
+        SELECT status, COUNT(*)::bigint AS count
+        FROM latest
+        WHERE rn = 1
+        GROUP BY status
+        ORDER BY status ASC
+        """
+    )
+    summary = {str(row["status"]): int(row["count"]) for row in summary_rows}
+
+    return {
+        "object": "list",
+        "data": rows,
+        "count": len(rows),
+        "summary": summary,
+        "incomplete_only": incomplete_only,
+    }
 
 
 async def generate_query_embedding(query: str) -> List[float]:
@@ -300,6 +438,7 @@ async def _safe_query_embedding(query: str) -> Optional[list[float]]:
 
 # ── Structured story metadata (genres, tropes, kinks, heat level, etc.) ─────
 STORY_METADATA_TABLE = "story_metadata"
+INGEST_FILE_STAGE_TABLE = "ingest_file_stages"
 
 STORY_METADATA_ARRAY_FIELDS = [
     "genres",
@@ -365,6 +504,59 @@ async def ensure_story_metadata_table() -> None:
     await db.execute_raw(
         f"CREATE INDEX IF NOT EXISTS story_metadata_vector_store_idx "
         f"ON {STORY_METADATA_TABLE} (vector_store_id)"
+    )
+
+
+async def ensure_ingest_file_stage_table() -> None:
+    """Create per-file ingest stage logs for audit and resume workflows."""
+    vector_store_table = settings.table_names["vector_stores"]
+    await db.execute_raw(
+        f"""
+        CREATE TABLE IF NOT EXISTS {INGEST_FILE_STAGE_TABLE} (
+            id BIGSERIAL PRIMARY KEY,
+            vector_store_id TEXT NOT NULL REFERENCES {vector_store_table}(id) ON DELETE CASCADE,
+            folder TEXT NOT NULL,
+            filename TEXT NOT NULL,
+            stage TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'in_progress',
+            detail JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+            error TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """
+    )
+    await db.execute_raw(
+        f"CREATE INDEX IF NOT EXISTS ingest_file_stage_lookup_idx "
+        f"ON {INGEST_FILE_STAGE_TABLE} (vector_store_id, folder, filename, created_at DESC)"
+    )
+
+
+async def record_ingest_file_stage(
+    vector_store_id: str,
+    folder: str,
+    filename: str,
+    stage: str,
+    *,
+    status: str = "in_progress",
+    detail: Optional[dict[str, Any]] = None,
+    error: Optional[str] = None,
+) -> None:
+    if not filename:
+        return
+    await db.execute_raw(
+        f"""
+        INSERT INTO {INGEST_FILE_STAGE_TABLE}
+            (vector_store_id, folder, filename, stage, status, detail, error, created_at)
+        VALUES
+            ($1, $2, $3, $4, $5, $6::jsonb, $7, NOW())
+        """,
+        vector_store_id,
+        folder,
+        filename,
+        stage,
+        status,
+        json.dumps(detail or {}),
+        error,
     )
 
 
@@ -541,6 +733,13 @@ def infer_story_metadata_from_text(filename: str, text: str, vector_store_name: 
     )
 
 
+def prepare_story_text_for_metadata(text: str) -> tuple[str, int]:
+    """Clamp metadata extraction input to stay within model context limits."""
+    if len(text) <= STORY_METADATA_MAX_CHARS:
+        return text, 0
+    return text[:STORY_METADATA_MAX_CHARS], len(text) - STORY_METADATA_MAX_CHARS
+
+
 async def extract_story_metadata_for_upload(
     filename: str,
     text: str,
@@ -551,10 +750,19 @@ async def extract_story_metadata_for_upload(
     Falls back to default StoryMetadata on extraction failures so uploads can
     continue even when the metadata model is unavailable.
     """
+    story_text, dropped_chars = prepare_story_text_for_metadata(text)
+    if dropped_chars > 0:
+        record_activity(
+            "story_metadata_text_truncated",
+            f"Metadata input truncated for {filename}",
+            filename=filename,
+            used_chars=len(story_text),
+            dropped_chars=dropped_chars,
+        )
     try:
         extracted = await extract_with_retry(
             filename=filename,
-            story_text=text,
+            story_text=story_text,
             model=settings.story_metadata_llm_model,
             api_base=settings.story_metadata_llm_api_base or settings.embedding.base_url,
             api_key=settings.story_metadata_llm_api_key or settings.embedding.api_key,
@@ -1304,10 +1512,11 @@ async def extract_story_metadata_for_ui(
     api_key: str = Depends(get_api_key),
 ):
     """Extract structured story metadata using server-side LiteLLM settings."""
+    story_text, _ = prepare_story_text_for_metadata(request.text)
     try:
         return await extract_with_retry(
             filename=request.filename,
-            story_text=request.text,
+            story_text=story_text,
             model=settings.story_metadata_llm_model,
             api_base=settings.story_metadata_llm_api_base or settings.embedding.base_url,
             api_key=settings.story_metadata_llm_api_key or settings.embedding.api_key,
@@ -1735,11 +1944,27 @@ async def upload_text_files(
     embedding_requests: list[EmbeddingCreateRequest] = []
     file_summaries: list[dict[str, Any]] = []
     extracted_story_metadata: dict[str, StoryMetadata] = {}
+    file_stage_details: dict[str, dict[str, Any]] = {}
 
     for upload in files:
         if not upload.filename:
             continue
+        await record_ingest_file_stage(
+            resolved_vector_store_id,
+            resolved_vector_store_name,
+            upload.filename,
+            "queued",
+            status="queued",
+        )
         if not upload.filename.lower().endswith(".txt"):
+            await record_ingest_file_stage(
+                resolved_vector_store_id,
+                resolved_vector_store_name,
+                upload.filename,
+                "failed",
+                status="failed",
+                error="Only .txt files are supported",
+            )
             raise HTTPException(
                 status_code=400,
                 detail=f"Only .txt files are supported: {upload.filename}",
@@ -1748,7 +1973,22 @@ async def upload_text_files(
         raw_bytes = await upload.read()
         try:
             backup_uploaded_text_file(resolved_vector_store_name, upload.filename, raw_bytes)
+            await record_ingest_file_stage(
+                resolved_vector_store_id,
+                resolved_vector_store_name,
+                upload.filename,
+                "backed_up",
+                status="completed",
+            )
         except Exception as exc:
+            await record_ingest_file_stage(
+                resolved_vector_store_id,
+                resolved_vector_store_name,
+                upload.filename,
+                "failed",
+                status="failed",
+                error=f"Backup failed: {str(exc)}",
+            )
             raise HTTPException(status_code=500, detail=f"Failed to back up file {upload.filename}: {str(exc)}")
         try:
             text = raw_bytes.decode("utf-8")
@@ -1760,14 +2000,45 @@ async def upload_text_files(
             text,
             resolved_vector_store_name,
         )
+        await record_ingest_file_stage(
+            resolved_vector_store_id,
+            resolved_vector_store_name,
+            upload.filename,
+            "metadata_extracted",
+            status="completed",
+        )
 
         chunks = chunk_text(text, max_chars=chunk_size, overlap=chunk_overlap)
         if not chunks:
+            await record_ingest_file_stage(
+                resolved_vector_store_id,
+                resolved_vector_store_name,
+                upload.filename,
+                "skipped",
+                status="skipped",
+                detail={"reason": "No usable text content found"},
+            )
             continue
 
         try:
             embeddings = await embedding_service.generate_embeddings(chunks)
+            await record_ingest_file_stage(
+                resolved_vector_store_id,
+                resolved_vector_store_name,
+                upload.filename,
+                "embeddings_generated",
+                status="completed",
+                detail={"chunk_count": len(chunks)},
+            )
         except Exception as exc:
+            await record_ingest_file_stage(
+                resolved_vector_store_id,
+                resolved_vector_store_name,
+                upload.filename,
+                "failed",
+                status="failed",
+                error=f"Embedding generation failed: {str(exc)}",
+            )
             raise HTTPException(
                 status_code=502,
                 detail=(
@@ -1797,6 +2068,10 @@ async def upload_text_files(
                 "character_count": len(text),
             }
         )
+        file_stage_details[upload.filename] = {
+            "chunk_count": len(chunks),
+            "character_count": len(text),
+        }
         record_activity(
             "file_completed",
             f"Processed {upload.filename}",
@@ -1814,7 +2089,34 @@ async def upload_text_files(
         resolved_vector_store_id,
         embedding_requests,
     )
+    for filename, details in file_stage_details.items():
+        await record_ingest_file_stage(
+            resolved_vector_store_id,
+            resolved_vector_store_name,
+            filename,
+            "embeddings_inserted",
+            status="completed",
+            detail=details,
+        )
+
     metadata_rows_upserted = await upsert_story_metadata_rows(resolved_vector_store_id, extracted_story_metadata)
+    for filename, details in file_stage_details.items():
+        await record_ingest_file_stage(
+            resolved_vector_store_id,
+            resolved_vector_store_name,
+            filename,
+            "metadata_upserted",
+            status="completed",
+            detail=details,
+        )
+        await record_ingest_file_stage(
+            resolved_vector_store_id,
+            resolved_vector_store_name,
+            filename,
+            "completed",
+            status="completed",
+            detail=details,
+        )
     record_activity(
         "upload_completed",
         f"Upload completed for store '{resolved_vector_store_name}'",
@@ -1881,6 +2183,7 @@ async def upload_text_files_stream(
             embedding_requests: list[EmbeddingCreateRequest] = []
             file_summaries: list[dict[str, Any]] = []
             extracted_story_metadata: dict[str, StoryMetadata] = {}
+            file_stage_details: dict[str, dict[str, Any]] = {}
             embedding_batch_size = max(1, min(64, settings.embedding.concurrency * 8))
 
             processed_index = 0
@@ -1889,6 +2192,14 @@ async def upload_text_files_stream(
                     continue
 
                 processed_index += 1
+                await record_ingest_file_stage(
+                    resolved_vector_store_id,
+                    resolved_vector_store_name,
+                    upload.filename,
+                    "queued",
+                    status="queued",
+                    detail={"index": processed_index, "total_files": total_files},
+                )
                 record_activity(
                     "file_started",
                     f"Starting {upload.filename}",
@@ -1908,6 +2219,14 @@ async def upload_text_files_stream(
                 ) + "\n"
 
                 if not upload.filename.lower().endswith(".txt"):
+                    await record_ingest_file_stage(
+                        resolved_vector_store_id,
+                        resolved_vector_store_name,
+                        upload.filename,
+                        "failed",
+                        status="failed",
+                        error="Only .txt files are supported",
+                    )
                     raise HTTPException(
                         status_code=400,
                         detail=f"Only .txt files are supported: {upload.filename}",
@@ -1916,7 +2235,22 @@ async def upload_text_files_stream(
                 raw_bytes = await upload.read()
                 try:
                     backup_uploaded_text_file(resolved_vector_store_name, upload.filename, raw_bytes)
+                    await record_ingest_file_stage(
+                        resolved_vector_store_id,
+                        resolved_vector_store_name,
+                        upload.filename,
+                        "backed_up",
+                        status="completed",
+                    )
                 except Exception as exc:
+                    await record_ingest_file_stage(
+                        resolved_vector_store_id,
+                        resolved_vector_store_name,
+                        upload.filename,
+                        "failed",
+                        status="failed",
+                        error=f"Backup failed: {str(exc)}",
+                    )
                     raise HTTPException(status_code=500, detail=f"Failed to back up file {upload.filename}: {str(exc)}")
                 try:
                     text = raw_bytes.decode("utf-8")
@@ -1928,9 +2262,24 @@ async def upload_text_files_stream(
                     text,
                     resolved_vector_store_name,
                 )
+                await record_ingest_file_stage(
+                    resolved_vector_store_id,
+                    resolved_vector_store_name,
+                    upload.filename,
+                    "metadata_extracted",
+                    status="completed",
+                )
 
                 chunks = chunk_text(text, max_chars=chunk_size, overlap=chunk_overlap)
                 if not chunks:
+                    await record_ingest_file_stage(
+                        resolved_vector_store_id,
+                        resolved_vector_store_name,
+                        upload.filename,
+                        "skipped",
+                        status="skipped",
+                        detail={"reason": "No usable text content found"},
+                    )
                     yield json.dumps(
                         {
                             "type": "file_skipped",
@@ -1963,7 +2312,23 @@ async def upload_text_files_stream(
                                 "total_chunks": total_chunks,
                             }
                         ) + "\n"
+                    await record_ingest_file_stage(
+                        resolved_vector_store_id,
+                        resolved_vector_store_name,
+                        upload.filename,
+                        "embeddings_generated",
+                        status="completed",
+                        detail={"chunk_count": len(chunks)},
+                    )
                 except Exception as exc:
+                    await record_ingest_file_stage(
+                        resolved_vector_store_id,
+                        resolved_vector_store_name,
+                        upload.filename,
+                        "failed",
+                        status="failed",
+                        error=f"Embedding generation failed: {str(exc)}",
+                    )
                     raise HTTPException(
                         status_code=502,
                         detail=(
@@ -2002,6 +2367,7 @@ async def upload_text_files_stream(
                     "character_count": len(text),
                 }
                 file_summaries.append(file_summary)
+                file_stage_details[upload.filename] = file_summary
                 record_activity(
                     "file_completed",
                     f"Processed {upload.filename}",
@@ -2030,10 +2396,37 @@ async def upload_text_files_stream(
                 resolved_vector_store_id,
                 embedding_requests,
             )
+            for filename, details in file_stage_details.items():
+                await record_ingest_file_stage(
+                    resolved_vector_store_id,
+                    resolved_vector_store_name,
+                    filename,
+                    "embeddings_inserted",
+                    status="completed",
+                    detail=details,
+                )
+
             metadata_rows_upserted = await upsert_story_metadata_rows(
                 resolved_vector_store_id,
                 extracted_story_metadata,
             )
+            for filename, details in file_stage_details.items():
+                await record_ingest_file_stage(
+                    resolved_vector_store_id,
+                    resolved_vector_store_name,
+                    filename,
+                    "metadata_upserted",
+                    status="completed",
+                    detail=details,
+                )
+                await record_ingest_file_stage(
+                    resolved_vector_store_id,
+                    resolved_vector_store_name,
+                    filename,
+                    "completed",
+                    status="completed",
+                    detail=details,
+                )
 
             result_payload = {
                 "vector_store_id": resolved_vector_store_id,
